@@ -1,0 +1,424 @@
+"""StockAI – מערכת ניתוח ואיתות למניות בשוק האמריקאי.
+
+הרצה:  streamlit run app.py
+"""
+from __future__ import annotations
+
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from plotly.subplots import make_subplots
+
+from engine import data as D
+from engine.alerts import format_alert, load_config, save_config, send_telegram
+from engine.analyzer import Settings, analyze, day_change, quick_scan
+
+st.set_page_config(page_title="StockAI – ניתוח מניות", page_icon="📈", layout="wide")
+
+st.markdown("""
+<style>
+.main .block-container, [data-testid="stSidebar"] {direction: rtl; text-align: right;}
+[data-testid="stMetric"] {direction: rtl;}
+.js-plotly-plot, .stDataFrame, code, pre {direction: ltr; text-align: left;}
+.signal-box {padding: 18px 22px; border-radius: 14px; color: white; font-size: 1.6rem;
+             font-weight: 700; text-align: center; margin-bottom: 8px;}
+.reason {font-size: 0.95rem; margin: 2px 0;}
+.small {color: #888; font-size: 0.85rem;}
+</style>
+""", unsafe_allow_html=True)
+
+COLORS = {"strong_buy": "#0a8f3c", "buy": "#2fb45a", "hold": "#8a8f98",
+          "sell": "#e0573b", "strong_sell": "#b3161b"}
+BAR_MIN = {"1m": 1, "2m": 2, "5m": 5, "15m": 15, "30m": 30, "60m": 60, "90m": 90,
+           "1d": 390, "1wk": 1950}
+INTERVAL_LABEL = {"1m": "דקה", "2m": "2 דקות", "5m": "5 דקות", "15m": "15 דקות",
+                  "30m": "30 דקות", "60m": "שעה", "1d": "יומי", "1wk": "שבועי"}
+
+cfg = load_config()
+ss = st.session_state
+ss.setdefault("last_action", {})
+
+
+def horizon_text(interval: str, bars: int) -> str:
+    if interval == "1d":
+        return f"{bars} ימי מסחר"
+    if interval == "1wk":
+        return f"{bars} שבועות"
+    m = BAR_MIN[interval] * bars
+    return f"{m} דקות" if m < 60 else f"{m / 60:.1f} שעות"
+
+
+# ───────────────────────────── Sidebar ─────────────────────────────
+with st.sidebar:
+    st.title("📈 StockAI")
+    ticker = st.text_input("סימול מניה", value=ss.get("ticker", "NVDA")).upper().strip()
+    ss["ticker"] = ticker
+    interval = st.selectbox("אינטרוול גרף", list(INTERVAL_LABEL),
+                            index=list(INTERVAL_LABEL).index(cfg["interval"]),
+                            format_func=lambda k: f"{k} – {INTERVAL_LABEL[k]}")
+    horizon = st.slider("אופק התחזית (מספר נרות קדימה)", 1, 60, int(cfg["horizon"]))
+    st.caption(f"התחזית: האם המחיר יהיה גבוה יותר בעוד **{horizon_text(interval, horizon)}**")
+    c1, c2 = st.columns(2)
+    buy_th = c1.number_input("סף קנייה", 0.5, 0.95, float(cfg["buy_th"]), 0.01)
+    sell_th = c2.number_input("סף מכירה", 0.05, 0.5, float(cfg["sell_th"]), 0.01)
+    refresh = st.select_slider("רענון אוטומטי (דקות)", [0, 1, 2, 3, 5, 10, 15, 30, 60],
+                               value=int(cfg["refresh_minutes"]),
+                               format_func=lambda v: "כבוי" if v == 0 else str(v))
+    with st.expander("שכבות ניתוח"):
+        use_news = st.checkbox("סנטימנט חדשות", True)
+        use_market = st.checkbox("מצב השוק הכללי (SPY/VIX)", True)
+        use_mtf = st.checkbox("אישור מטווח זמן גבוה", True)
+        prepost = st.checkbox("כולל מסחר לפני/אחרי שעות", False)
+    with st.expander("התראות טלגרם"):
+        tg_tok = st.text_input("Bot token", cfg["telegram_token"], type="password")
+        tg_chat = st.text_input("Chat ID", cfg["telegram_chat_id"])
+        alert_p = st.slider("התרע כשההסתברות מעל", 0.55, 0.9, float(cfg["alert_min_prob"]), 0.01)
+        if st.button("שלח הודעת בדיקה"):
+            ok = send_telegram("✅ StockAI מחובר", {"telegram_token": tg_tok, "telegram_chat_id": tg_chat})
+            if ok:
+                st.success("נשלח")
+            else:
+                st.error("השליחה נכשלה – בדוק token / chat id")
+    if st.button("💾 שמור הגדרות כברירת מחדל"):
+        cfg.update(interval=interval, horizon=horizon, buy_th=buy_th, sell_th=sell_th,
+                   refresh_minutes=refresh, telegram_token=tg_tok, telegram_chat_id=tg_chat,
+                   alert_min_prob=alert_p)
+        save_config(cfg)
+        st.success("נשמר")
+    mo = D.is_market_open()
+    st.markdown(f"**שוק ארה\"ב:** {'🟢 פתוח' if mo else '🔴 סגור'}")
+    st.caption("⚠️ כלי עזר לניתוח בלבד – לא ייעוץ השקעות. הסתברות היא הערכה סטטיסטית ולא ודאות.")
+
+settings = Settings(interval=interval, horizon=horizon, buy_th=buy_th, sell_th=sell_th,
+                    use_news=use_news, use_market=use_market, use_mtf=use_mtf, prepost=prepost)
+tg_cfg = {"telegram_token": tg_tok, "telegram_chat_id": tg_chat}
+
+
+# ───────────────────────────── Charts ─────────────────────────────
+def price_chart(r) -> go.Figure:
+    x = r.frame.tail(300 if interval in D.INTRADAY else 400)
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.02,
+                        row_heights=[0.55, 0.13, 0.16, 0.16])
+    fig.add_trace(go.Candlestick(x=x.index, open=x["Open"], high=x["High"], low=x["Low"],
+                                 close=x["Close"], name="מחיר",
+                                 increasing_line_color="#26a69a", decreasing_line_color="#ef5350"), 1, 1)
+    for col, color in [("ema9", "#f5a623"), ("ema21", "#4a90e2"), ("ema50", "#9b59b6"), ("ema200", "#555")]:
+        if x[col].notna().any():
+            fig.add_trace(go.Scatter(x=x.index, y=x[col], name=col.upper(), line=dict(width=1.2, color=color)), 1, 1)
+    fig.add_trace(go.Scatter(x=x.index, y=x["vwap"], name="VWAP",
+                             line=dict(width=1.3, dash="dot", color="#e91e63")), 1, 1)
+    fig.add_trace(go.Scatter(x=x.index, y=x["bb_up"], name="BB", line=dict(width=0.6, color="#aaa"),
+                             showlegend=False), 1, 1)
+    fig.add_trace(go.Scatter(x=x.index, y=x["bb_lo"], name="BB", line=dict(width=0.6, color="#aaa"),
+                             fill="tonexty", fillcolor="rgba(150,150,150,0.07)", showlegend=False), 1, 1)
+    lv = r.levels
+    for s_ in lv["supports"]:
+        fig.add_hline(y=s_, line=dict(color="#26a69a", width=1, dash="dash"), row=1, col=1)
+    for r_ in lv["resistances"]:
+        fig.add_hline(y=r_, line=dict(color="#ef5350", width=1, dash="dash"), row=1, col=1)
+    fig.add_hline(y=lv["stop"], line=dict(color="red", width=1.5), annotation_text="סטופ", row=1, col=1)
+    fig.add_hline(y=lv["target"], line=dict(color="green", width=1.5), annotation_text="יעד", row=1, col=1)
+    vc = np.where(x["Close"] >= x["Open"], "#26a69a", "#ef5350")
+    fig.add_trace(go.Bar(x=x.index, y=x["Volume"], marker_color=vc, name="נפח", showlegend=False), 2, 1)
+    fig.add_trace(go.Scatter(x=x.index, y=x["rsi"], name="RSI", line=dict(color="#7e57c2")), 3, 1)
+    fig.add_hline(y=70, line=dict(color="red", width=0.7, dash="dot"), row=3, col=1)
+    fig.add_hline(y=30, line=dict(color="green", width=0.7, dash="dot"), row=3, col=1)
+    hc = np.where(x["hist"] >= 0, "#26a69a", "#ef5350")
+    fig.add_trace(go.Bar(x=x.index, y=x["hist"], marker_color=hc, name="MACD hist", showlegend=False), 4, 1)
+    fig.add_trace(go.Scatter(x=x.index, y=x["macd"], name="MACD", line=dict(color="#2196f3", width=1)), 4, 1)
+    fig.add_trace(go.Scatter(x=x.index, y=x["signal"], name="Signal", line=dict(color="#ff9800", width=1)), 4, 1)
+    fig.update_layout(height=820, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10),
+                      legend=dict(orientation="h", y=1.03), hovermode="x unified")
+    if interval in D.INTRADAY and not prepost:
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"]), dict(bounds=[16, 9.5], pattern="hour")])
+    elif interval in D.INTRADAY:
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    else:
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    for i, t in enumerate(["", "נפח", "RSI", "MACD"], start=1):
+        if t:
+            fig.update_yaxes(title_text=t, row=i, col=1)
+    return fig
+
+
+def gauge(p: float) -> go.Figure:
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number", value=p * 100, number={"suffix": "%", "font": {"size": 44}},
+        title={"text": "הסתברות לעלייה"},
+        gauge={"axis": {"range": [0, 100]}, "bar": {"color": "#222", "thickness": 0.25},
+               "steps": [{"range": [0, 30], "color": "#b3161b"}, {"range": [30, 40], "color": "#e0573b"},
+                         {"range": [40, 60], "color": "#c9cdd3"}, {"range": [60, 70], "color": "#2fb45a"},
+                         {"range": [70, 100], "color": "#0a8f3c"}]}))
+    fig.update_layout(height=260, margin=dict(l=20, r=20, t=50, b=0))
+    return fig
+
+
+def fmt_big(n):
+    if n is None or (isinstance(n, float) and np.isnan(n)):
+        return "—"
+    for unit, div in (("T", 1e12), ("B", 1e9), ("M", 1e6)):
+        if abs(n) >= div:
+            return f"{n / div:.2f}{unit}"
+    return f"{n:,.0f}"
+
+
+# ───────────────────────────── Tabs ─────────────────────────────
+tab_a, tab_s, tab_m, tab_n, tab_b, tab_h = st.tabs(
+    ["📈 ניתוח מניה", "🔎 סורק מניות", "🌎 מגמות שוק", "📰 חדשות", "🧪 בדיקה היסטורית", "❓ איך זה עובד"])
+
+
+def render_analysis():
+    if not ticker:
+        st.info("הזן סימול מניה")
+        return
+    try:
+        with st.spinner(f"מנתח את {ticker}..."):
+            r = analyze(ticker, settings)
+    except Exception as e:
+        st.error(f"שגיאה בניתוח {ticker}: {e}")
+        return
+    ss["result"] = r
+
+    # alert on signal change
+    prev = ss["last_action"].get(ticker)
+    strong = r.p_up >= alert_p or r.p_up <= 1 - alert_p
+    if prev and prev != r.action_level and r.action_level != "hold":
+        st.toast(f"{ticker}: איתות חדש – {r.action} ({r.p_up * 100:.0f}%)", icon="🔔")
+    if strong and prev != r.action_level:
+        send_telegram(format_alert(r), tg_cfg)
+    ss["last_action"][ticker] = r.action_level
+
+    name = r.info.get("shortName") or ticker
+    st.subheader(f"{name} ({ticker})")
+    st.caption(f"עודכן: {datetime.now():%H:%M:%S} | נר אחרון: {r.frame.index[-1]} | "
+               f"תחזית ל-{horizon_text(interval, horizon)} קדימה"
+               + (f" | רענון כל {refresh} דק'" if refresh else ""))
+
+    g, sig, lv = st.columns([1.2, 1, 1.2])
+    with g:
+        st.plotly_chart(gauge(r.p_up), use_container_width=True)
+    with sig:
+        st.markdown(f"<div class='signal-box' style='background:{COLORS[r.action_level]}'>{r.action}</div>",
+                    unsafe_allow_html=True)
+        st.metric("מחיר", f"{r.price:,.2f}", f"{day_change(r.frame):+.2f}% היום")
+        auc = r.model["auc"]
+        q = "גבוהה" if auc >= 0.58 else "בינונית" if auc >= 0.53 else "נמוכה – כמעט ללא יתרון"
+        st.markdown(f"**אמינות המודל למניה זו:** {q}  \n<span class='small'>AUC={auc:.3f} | "
+                    f"דיוק={r.model['accuracy'] * 100:.1f}% על {r.model['n_oos']:,} תחזיות מחוץ למדגם</span>",
+                    unsafe_allow_html=True)
+    with lv:
+        L = r.levels
+        dirn = "לונג" if r.p_up >= 0.5 else "שורט"
+        st.markdown(f"**רמות מסחר מוצעות ({dirn})**")
+        a, b = st.columns(2)
+        a.metric("סטופ לוס", f"{L['stop']:.2f}", f"{(L['stop'] / r.price - 1) * 100:+.2f}%")
+        b.metric("יעד רווח", f"{L['target']:.2f}", f"{(L['target'] / r.price - 1) * 100:+.2f}%")
+        a.metric("סיכון:סיכוי", f"1:{L['rr']:.1f}")
+        b.metric("ATR", f"{L['atr']:.2f}")
+        st.caption("תמיכות: " + ", ".join(f"{v:.2f}" for v in L["supports"][:3]) + "  \n"
+                   "התנגדויות: " + ", ".join(f"{v:.2f}" for v in L["resistances"][:3]))
+
+    st.plotly_chart(price_chart(r), use_container_width=True)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("#### 🧠 למה? – סיבות טכניות")
+        for t in r.tech_reasons[:10]:
+            st.markdown(f"<div class='reason'>{t}</div>", unsafe_allow_html=True)
+        for nm, d in r.patterns:
+            st.markdown(f"<div class='reason'>{'🟢' if d > 0 else '🔴' if d < 0 else '⚪'} תבנית: {nm}</div>",
+                        unsafe_allow_html=True)
+    with c2:
+        st.markdown("#### ⚖️ מרכיבי ההסתברות")
+        b = dict(r.breakdown)
+        base = b.pop("מודל ML (מכויל)")
+        st.write(f"בסיס – מודל ML מכויל: **{base * 100:.1f}%**")
+        for k, v in b.items():
+            st.write(f"{'⬆️' if v > 0 else '⬇️'} {k}: {v:+.2f} (לוגיט)")
+        st.write(f"**= סופי: {r.p_up * 100:.1f}%**")
+        st.markdown("#### 🔬 משתנים מובילים במודל")
+        cb = r.model["contrib"]
+        top = pd.concat([cb.head(4), cb.tail(4)])
+        st.bar_chart(top.rename("השפעה"), horizontal=True, height=230)
+    with c3:
+        st.markdown("#### 🌐 הקשר")
+        if r.market:
+            st.write("**שוק:** " + " · ".join(r.market["notes"]))
+        if r.mtf:
+            st.write("**טווח גבוה:** " + " · ".join(r.mtf["notes"]))
+        if r.news:
+            n = r.news
+            st.write(f"**חדשות:** סנטימנט {n['score']:+.2f} | 🟢{n['positive']} 🔴{n['negative']} "
+                     f"⚪{n['neutral']} | {n['buzz_24h']} כתבות ב-24 שעות")
+        i = r.info
+        if i:
+            st.markdown("**נתוני יסוד ואנליסטים**")
+            rows = {"סקטור": i.get("sector"), "שווי שוק": fmt_big(i.get("marketCap")),
+                    "מכפיל רווח": i.get("trailingPE"), "מכפיל עתידי": i.get("forwardPE"),
+                    "בטא": i.get("beta"), "המלצת אנליסטים": i.get("recommendationKey"),
+                    "מחיר יעד ממוצע": i.get("targetMeanPrice"),
+                    "שורט מהצף": f"{i['shortPercentOfFloat'] * 100:.1f}%" if i.get("shortPercentOfFloat") else None,
+                    "דוחות הבאים": i.get("earningsDate")}
+            for k, v in rows.items():
+                if v is not None:
+                    st.write(f"{k}: **{round(v, 2) if isinstance(v, float) else v}**")
+
+    if r.news and r.news["items"]:
+        with st.expander(f"📰 כתבות אחרונות על {ticker} ({len(r.news['items'])})"):
+            for it in r.news["items"][:25]:
+                em = "🟢" if it["sentiment"] > 0.15 else "🔴" if it["sentiment"] < -0.15 else "⚪"
+                age = f"לפני {it['age_h']:.0f} ש'" if it["age_h"] < 48 else f"לפני {it['age_h'] / 24:.0f} ימים"
+                st.markdown(f"{em} [{it['title']}]({it['link']}) <span class='small'>· {it['source']} · {age}</span>",
+                            unsafe_allow_html=True)
+
+
+with tab_a:
+    if refresh:
+        st.fragment(run_every=refresh * 60)(render_analysis)()
+    else:
+        render_analysis()
+
+
+# ───── Scanner ─────
+with tab_s:
+    st.markdown("### 🔎 סורק – מדרג את המניות לפי חוזק האיתות")
+    wl_text = st.text_area("רשימת מעקב (מופרדות בפסיק)", ", ".join(cfg["watchlist"]), height=80)
+    wl = [t.strip().upper() for t in wl_text.replace("\n", ",").split(",") if t.strip()]
+    cc1, cc2, cc3 = st.columns(3)
+    run_scan = cc1.button("▶️ הרץ סריקה", type="primary")
+    if cc2.button("💾 שמור רשימה"):
+        cfg["watchlist"] = wl
+        save_config(cfg)
+        st.success("נשמר")
+    preset = cc3.selectbox("או טען רשימה מוכנה", ["—", "מגה-קאפ טכנולוגיה", "שבבים", "פיננסים", "מומנטום/תנודתיות"])
+    presets = {"מגה-קאפ טכנולוגיה": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "ORCL", "NFLX"],
+               "שבבים": ["NVDA", "AMD", "AVGO", "TSM", "MU", "INTC", "QCOM", "ARM", "SMCI", "MRVL", "ASML"],
+               "פיננסים": ["JPM", "BAC", "GS", "MS", "WFC", "C", "V", "MA", "AXP", "COIN"],
+               "מומנטום/תנודתיות": ["PLTR", "COIN", "MSTR", "SMCI", "HOOD", "SOFI", "RIVN", "AFRM", "UPST", "IONQ"]}
+    if preset != "—":
+        wl = presets[preset]
+        st.caption("סורק: " + ", ".join(wl))
+    if run_scan or preset != "—":
+        bar = st.progress(0.0, "מתחיל...")
+        df = quick_scan(wl, settings, progress=lambda p, t: bar.progress(min(p, 1.0), f"מנתח {t}..."))
+        bar.empty()
+        ss["scan"] = df
+    if "scan" in ss:
+        df = ss["scan"]
+
+        def color(v):
+            if not isinstance(v, (int, float)) or pd.isna(v):
+                return ""
+            if v >= buy_th * 100:
+                return "background-color: rgba(47,180,90,.35)"
+            if v <= sell_th * 100:
+                return "background-color: rgba(224,87,59,.35)"
+            return ""
+        sty = df.style.map(color, subset=["סיכוי עלייה %"]) if "סיכוי עלייה %" in df else df
+        st.dataframe(sty, use_container_width=True, hide_index=True, height=560)
+        st.caption("ממוין לפי חוזק האיתות (מרחק מ-50%). שים לב לעמודת AUC – מעל 0.55 = למודל יש יתרון מוכח במניה זו.")
+
+
+# ───── Market trends ─────
+with tab_m:
+    st.markdown("### 🌎 תמונת מצב – השוק האמריקאי")
+    try:
+        idx = D.get_snapshot(tuple(D.INDEXES))
+        cols = st.columns(len(idx))
+        for c, (_, row) in zip(cols, idx.iterrows()):
+            c.metric(D.INDEXES.get(row["ticker"], row["ticker"]), f"{row['price']:,.2f}", f"{row['day_%']:+.2f}%")
+        reg = D.market_regime()
+        st.info("**מצב השוק:** " + " · ".join(reg["notes"]) + f"  → ציון {reg['score']:+.2f}")
+        sec = D.get_snapshot(tuple(D.SECTOR_ETFS))
+        sec["סקטור"] = sec["ticker"].map(D.SECTOR_ETFS)
+        per = st.radio("תקופה", ["day_%", "week_%", "month_%"], horizontal=True,
+                       format_func={"day_%": "יום", "week_%": "שבוע", "month_%": "חודש"}.get)
+        sec = sec.sort_values(per)
+        fig = go.Figure(go.Bar(x=sec[per], y=sec["סקטור"], orientation="h",
+                               marker_color=np.where(sec[per] >= 0, "#26a69a", "#ef5350"),
+                               text=sec[per].map(lambda v: f"{v:+.2f}%"), textposition="outside"))
+        fig.update_layout(height=460, title="ביצועי סקטורים (רוטציה)", margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+        breadth = sec["above_50d"].mean() * 100
+        st.write(f"**רוחב שוק:** {breadth:.0f}% מהסקטורים נסחרים מעל ממוצע 50 יום")
+    except Exception as e:
+        st.error(f"שגיאה בטעינת נתוני שוק: {e}")
+
+
+# ───── News ─────
+with tab_n:
+    st.markdown("### 📰 חדשות שוק כלליות + סנטימנט")
+    try:
+        from engine.sentiment import analyze_news
+        mn = analyze_news(D.get_market_news())
+        st.metric("סנטימנט שוק כללי", f"{mn['score']:+.2f}",
+                  f"🟢{mn['positive']} / 🔴{mn['negative']} כתבות")
+        for it in mn["items"]:
+            em = "🟢" if it["sentiment"] > 0.15 else "🔴" if it["sentiment"] < -0.15 else "⚪"
+            st.markdown(f"{em} [{it['title']}]({it['link']}) <span class='small'>· {it['source']} · "
+                        f"לפני {it['age_h']:.0f} ש'</span>", unsafe_allow_html=True)
+    except Exception as e:
+        st.error(f"שגיאה בטעינת חדשות: {e}")
+
+
+# ───── Backtest ─────
+with tab_b:
+    r = ss.get("result")
+    if not r:
+        st.info("הרץ קודם ניתוח מניה בלשונית הראשונה")
+    else:
+        m = r.model
+        bt = m["backtest"]
+        st.markdown(f"### 🧪 בדיקה היסטורית Walk-Forward – {r.ticker} ({interval}, אופק {horizon_text(interval, horizon)})")
+        st.caption("המודל אומן בכל פעם רק על העבר וחזה את התקופה הבאה שלא ראה – זו הדרך הכנה למדוד אמינות.")
+        k = st.columns(6)
+        k[0].metric("AUC", f"{m['auc']:.3f}")
+        k[1].metric("דיוק כיוון", f"{m['accuracy'] * 100:.1f}%")
+        k[2].metric("שיעור עליות בסיסי", f"{m['base_rate'] * 100:.1f}%")
+        if bt:
+            k[3].metric("עסקאות", bt["trades"])
+            k[4].metric("אחוז הצלחה", "—" if np.isnan(bt["win_rate"]) else f"{bt['win_rate'] * 100:.1f}%")
+            k[5].metric("תשואת אסטרטגיה", f"{bt['total_%']:+.1f}%", f"קנה-והחזק {bt['buyhold_%']:+.1f}%")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=bt["equity"].index, y=(bt["equity"] - 1) * 100, name="אסטרטגיה"))
+            fig.add_trace(go.Scatter(x=bt["buyhold"].index, y=(bt["buyhold"] - 1) * 100, name="קנה והחזק"))
+            fig.update_layout(height=380, title="תשואה מצטברת % (כולל עמלה 2bps לעסקה)",
+                              margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+            st.write(f"דיוק בקניות: **{bt['long_hit'] * 100:.1f}%** | דיוק במכירות: "
+                     f"**{bt['short_hit'] * 100:.1f}%** | ירידה מקסימלית: **{bt['max_dd_%']:.1f}%**"
+                     if not (np.isnan(bt["long_hit"]) or np.isnan(bt["short_hit"])) else
+                     "לא היו מספיק איתותים מעבר לספים – המודל לא מצא יתרון ברור.")
+        if m["reliability"] is not None:
+            st.markdown("#### טבלת כיול – כשהמודל אמר X%, כמה פעמים זה באמת עלה?")
+            rel = m["reliability"].reset_index()
+            rel["bucket"] = rel["bucket"].astype(str)
+            rel["actual_up_rate"] = (rel["actual_up_rate"] * 100).round(1)
+            st.dataframe(rel.rename(columns={"bucket": "טווח הסתברות", "actual_up_rate": "% עלייה בפועל",
+                                             "n": "מספר מקרים"}), hide_index=True)
+
+
+# ───── Help ─────
+with tab_h:
+    st.markdown("""
+### איך המערכת מחשבת את ההסתברות
+1. **נתונים** – נרות תוך-יומיים/יומיים מ-Yahoo Finance, חדשות מ-Yahoo ו-Google News, מדדים, VIX וסקטורים.
+2. **25+ אינדיקטורים** – EMA 9/21/50/200, MACD, RSI, בולינגר, סטוכסטי, ADX/DMI, ATR, VWAP, OBV, MFI, CCI, Williams %R, SuperTrend, נפח יחסי, תמיכה/התנגדות ותבניות נרות.
+3. **מודל למידת מכונה** – אנסמבל של רגרסיה לוגיסטית + Gradient Boosting, שמאומן על ההיסטוריה של המניה הספציפית
+   ושואל: *"האם המחיר יהיה גבוה יותר בעוד H נרות?"*
+4. **Walk-Forward אמיתי** – המודל נבדק רק על נתונים שלא ראה. מזה נמדדים AUC ודיוק, וההסתברות **מכוילת**:
+   אם המודל לא הוכיח יתרון (AUC≈0.5) – ההסתברות נמשכת אוטומטית לשיעור הבסיס ולא תראה לך "ביטחון" מזויף.
+5. **שכבות התאמה** – סנטימנט חדשות (משוקלל לפי טריות), מצב השוק (SPY מול ממוצעים, VIX), אישור מטווח זמן גבוה, תבניות נרות.
+6. **רמות מסחר** – סטופ/יעד לפי ATR ותמיכות/התנגדויות.
+
+### איך לקרוא את התוצאה
+- **AUC** מעל 0.55 = יתרון סטטיסטי קיים; מעל 0.60 = חזק (נדיר בשוק אמיתי). מתחת ל-0.53 – התייחס לאיתות בזהירות רבה.
+- הסתברות 65% פירושה שבהיסטוריה, במצבים דומים, המחיר עלה בערך 65% מהפעמים – **35% מהפעמים הוא ירד**. לכן תמיד סטופ.
+- נתוני Yahoo בחינם עשויים להתעכב בכמה דקות.
+
+### ⚠️ אחריות
+הכלי מיועד ללימוד ולתמיכה בהחלטה. אין בו ייעוץ השקעות, ואין מערכת שיודעת לחזות את השוק בוודאות.
+""")
