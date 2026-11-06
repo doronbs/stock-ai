@@ -1,0 +1,280 @@
+"""Orchestrates data -> indicators -> ML model -> news -> market -> final recommendation."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+import pandas as pd
+
+from . import data as D
+from . import indicators as I
+from .model import train_and_predict
+from .sentiment import analyze_news
+
+
+@dataclass
+class Settings:
+    interval: str = "5m"
+    horizon: int = 12            # bars ahead the prediction refers to
+    buy_th: float = 0.60
+    sell_th: float = 0.40
+    use_news: bool = True
+    use_market: bool = True
+    use_mtf: bool = True
+    prepost: bool = False
+    w_news: float = 0.35         # logit weights of the adjustment layers
+    w_market: float = 0.15
+    w_tech: float = 0.25
+    w_mtf: float = 0.20
+
+
+@dataclass
+class Result:
+    ticker: str
+    price: float
+    p_up: float
+    action: str
+    action_level: str
+    model: dict
+    tech_score: float
+    tech_reasons: list
+    news: dict | None
+    market: dict | None
+    mtf: dict | None
+    levels: dict
+    patterns: list
+    frame: pd.DataFrame
+    info: dict = field(default_factory=dict)
+    breakdown: dict = field(default_factory=dict)
+
+
+def _logit(p):
+    p = min(max(p, 1e-4), 1 - 1e-4)
+    return np.log(p / (1 - p))
+
+
+def _sig(z):
+    return 1 / (1 + np.exp(-z))
+
+
+def technical_votes(x: pd.DataFrame) -> tuple[float, list]:
+    """Transparent rule-based score in [-1,1] with Hebrew explanations."""
+    r = x.iloc[-1]
+    p = x.iloc[-2]
+    votes = []
+
+    def v(w, cond_bull, cond_bear, txt_bull, txt_bear):
+        if cond_bull:
+            votes.append((w, f"🟢 {txt_bull}"))
+        elif cond_bear:
+            votes.append((-w, f"🔴 {txt_bear}"))
+
+    c = r["Close"]
+    v(1.0, c > r["ema21"] > r["ema50"], c < r["ema21"] < r["ema50"],
+      "מחיר מעל EMA21 ו-EMA50 – מגמה עולה", "מחיר מתחת ל-EMA21 ו-EMA50 – מגמה יורדת")
+    if not np.isnan(r["ema200"]):
+        v(0.7, c > r["ema200"], c < r["ema200"], "מעל EMA200 – מגמה ארוכה חיובית",
+          "מתחת ל-EMA200 – מגמה ארוכה שלילית")
+    v(1.0, p["ema9"] <= p["ema21"] and r["ema9"] > r["ema21"],
+      p["ema9"] >= p["ema21"] and r["ema9"] < r["ema21"],
+      "חציית EMA9 מעל EMA21 (Golden cross קצר)", "חציית EMA9 מתחת ל-EMA21 (Death cross קצר)")
+    v(0.8, r["hist"] > 0 and r["hist"] > p["hist"], r["hist"] < 0 and r["hist"] < p["hist"],
+      "MACD חיובי ומתחזק", "MACD שלילי ומתחזק כלפי מטה")
+    v(0.8, p["macd"] <= p["signal"] and r["macd"] > r["signal"],
+      p["macd"] >= p["signal"] and r["macd"] < r["signal"],
+      "חציית MACD כלפי מעלה", "חציית MACD כלפי מטה")
+    if r["rsi"] < 30:
+        votes.append((0.8, f"🟢 RSI במכירת יתר ({r['rsi']:.0f}) – פוטנציאל תיקון למעלה"))
+    elif r["rsi"] > 70:
+        votes.append((-0.8, f"🔴 RSI בקניית יתר ({r['rsi']:.0f}) – סיכון לתיקון"))
+    elif 50 < r["rsi"] < 65 and r["rsi"] > p["rsi"]:
+        votes.append((0.4, f"🟢 RSI במומנטום חיובי ({r['rsi']:.0f})"))
+    elif 35 < r["rsi"] < 50 and r["rsi"] < p["rsi"]:
+        votes.append((-0.4, f"🔴 RSI במומנטום שלילי ({r['rsi']:.0f})"))
+    if r["bb_pctb"] < 0.05:
+        votes.append((0.5, "🟢 מחיר ברצועת בולינגר התחתונה"))
+    elif r["bb_pctb"] > 0.95:
+        votes.append((-0.5, "🔴 מחיר ברצועת בולינגר העליונה"))
+    if r["adx"] > 25:
+        d = 1 if r["plus_di"] > r["minus_di"] else -1
+        votes.append((0.7 * d, f"{'🟢' if d > 0 else '🔴'} ADX={r['adx']:.0f} – מגמה חזקה "
+                                f"{'עולה' if d > 0 else 'יורדת'}"))
+    v(0.6, c > r["vwap"], c < r["vwap"], "מחיר מעל VWAP – קונים בשליטה", "מחיר מתחת ל-VWAP – מוכרים בשליטה")
+    v(0.6, r["supertrend"] > 0, r["supertrend"] < 0, "SuperTrend חיובי", "SuperTrend שלילי")
+    if r["vol_ratio"] > 1.8:
+        d = 1 if r["Close"] > r["Open"] else -1
+        votes.append((0.6 * d, f"{'🟢' if d > 0 else '🔴'} נפח מסחר חריג (x{r['vol_ratio']:.1f}) "
+                                f"בנר {'עולה' if d > 0 else 'יורד'}"))
+    if r["stoch_k"] < 20 and r["stoch_k"] > r["stoch_d"]:
+        votes.append((0.4, "🟢 סטוכסטי מתהפך מאזור מכירת יתר"))
+    elif r["stoch_k"] > 80 and r["stoch_k"] < r["stoch_d"]:
+        votes.append((-0.4, "🔴 סטוכסטי מתהפך מאזור קניית יתר"))
+    if r["mfi"] < 20:
+        votes.append((0.3, "🟢 MFI נמוך – לחץ מכירה מוצה"))
+    elif r["mfi"] > 80:
+        votes.append((-0.3, "🔴 MFI גבוה – לחץ קנייה מוצה"))
+    obv_slope = x["obv"].diff(10).iloc[-1]
+    v(0.4, obv_slope > 0 and c > x["Close"].iloc[-11], obv_slope < 0 and c < x["Close"].iloc[-11],
+      "OBV עולה – כסף נכנס", "OBV יורד – כסף יוצא")
+
+    total_w = 8.0  # normalisation constant ~ sum of typical active weights
+    score = float(np.tanh(sum(w for w, _ in votes) / total_w * 2))
+    reasons = [t for _, t in sorted(votes, key=lambda t: -abs(t[0]))]
+    return score, reasons
+
+
+def higher_timeframe(ticker: str, interval: str) -> dict | None:
+    hi = "1d" if interval in D.INTRADAY else "1wk"
+    try:
+        h = I.add_all(D.get_history(ticker, hi), intraday=False)
+    except Exception:
+        return None
+    r = h.iloc[-1]
+    s = 0.0
+    notes = []
+    if r["Close"] > r["ema50"]:
+        s += 0.4; notes.append(f"גרף {hi}: מעל EMA50")
+    else:
+        s -= 0.4; notes.append(f"גרף {hi}: מתחת ל-EMA50")
+    if not np.isnan(r["ema200"]):
+        if r["ema50"] > r["ema200"]:
+            s += 0.3; notes.append(f"גרף {hi}: EMA50 מעל EMA200")
+        else:
+            s -= 0.3; notes.append(f"גרף {hi}: EMA50 מתחת ל-EMA200")
+    s += 0.3 if r["hist"] > 0 else -0.3
+    notes.append(f"גרף {hi}: MACD {'חיובי' if r['hist'] > 0 else 'שלילי'}, RSI {r['rsi']:.0f}")
+    return {"score": max(-1, min(1, s)), "notes": notes, "interval": hi}
+
+
+def trade_levels(x: pd.DataFrame, direction: int, supports, resistances) -> dict:
+    c = float(x["Close"].iloc[-1])
+    a = float(x["atr"].iloc[-1])
+    if direction >= 0:
+        stop = c - 1.5 * a
+        tgt = c + 2.5 * a
+        if supports and supports[0] > stop and supports[0] < c:
+            stop = supports[0] - 0.25 * a
+        if resistances and c < resistances[0] < tgt:
+            tgt = resistances[0]
+    else:
+        stop = c + 1.5 * a
+        tgt = c - 2.5 * a
+        if resistances and c < resistances[0] < stop:
+            stop = resistances[0] + 0.25 * a
+        if supports and tgt < supports[0] < c:
+            tgt = supports[0]
+    rr = abs(tgt - c) / max(abs(c - stop), 1e-9)
+    return {"entry": c, "stop": stop, "target": tgt, "rr": rr, "atr": a,
+            "supports": supports, "resistances": resistances}
+
+
+def analyze(ticker: str, s: Settings, market: dict | None = None,
+            with_info: bool = True) -> Result:
+    ticker = ticker.upper().strip()
+    intraday = s.interval in D.INTRADAY
+    raw = D.get_history(ticker, s.interval, prepost=s.prepost)
+    x = I.add_all(raw, intraday)
+
+    model = train_and_predict(x, intraday, s.horizon, s.buy_th, s.sell_th)
+    tech, reasons = technical_votes(x)
+    supports, resistances = I.support_resistance(x)
+    patterns = I.candle_patterns(x)
+    info = D.get_info(ticker) if with_info else {}
+
+    news = None
+    if s.use_news:
+        try:
+            news = analyze_news(D.get_news(ticker, info.get("shortName")))
+        except Exception:
+            news = None
+    if s.use_market and market is None:
+        market = D.market_regime()
+    mtf = higher_timeframe(ticker, s.interval) if s.use_mtf else None
+
+    z = _logit(model["p_up"])
+    br = {"מודל ML (מכויל)": model["p_up"]}
+    # Technical/MTF layers overlap the model's own features; trust them in
+    # proportion to the edge the model actually proved out-of-sample.
+    trust = 0.3 + 0.7 * model["skill"]
+    adj = s.w_tech * tech * trust
+    br["ניתוח טכני"] = adj
+    if news and news["items"]:
+        # dampen if only a few headlines
+        conf = min(1.0, len(news["items"]) / 10)
+        n_adj = s.w_news * news["score"] * conf * 2
+        adj += n_adj
+        br["סנטימנט חדשות"] = n_adj
+    if market and s.use_market:
+        m_adj = s.w_market * market["score"]
+        adj += m_adj
+        br["מצב השוק"] = m_adj
+    if mtf:
+        t_adj = s.w_mtf * mtf["score"] * trust
+        adj += t_adj
+        br["טווח זמן גבוה"] = t_adj
+    pat_adj = 0.08 * sum(d for _, d in patterns)
+    adj += pat_adj
+    if pat_adj:
+        br["תבניות נרות"] = pat_adj
+    p = float(np.clip(_sig(z + adj), 0.03, 0.97))
+
+    if p >= max(s.buy_th + 0.1, 0.7):
+        action, lvl = "קנייה חזקה", "strong_buy"
+    elif p >= s.buy_th:
+        action, lvl = "קנייה", "buy"
+    elif p <= min(s.sell_th - 0.1, 0.3):
+        action, lvl = "מכירה חזקה", "strong_sell"
+    elif p <= s.sell_th:
+        action, lvl = "מכירה", "sell"
+    else:
+        action, lvl = "המתן / ניטרלי", "hold"
+
+    levels = trade_levels(x, 1 if p >= 0.5 else -1, supports, resistances)
+    return Result(ticker=ticker, price=float(x["Close"].iloc[-1]), p_up=p, action=action,
+                  action_level=lvl, model=model, tech_score=tech, tech_reasons=reasons,
+                  news=news, market=market, mtf=mtf, levels=levels, patterns=patterns,
+                  frame=x, info=info, breakdown=br)
+
+
+def day_change(x: pd.DataFrame) -> float:
+    """% change vs previous session close (works for intraday and daily frames)."""
+    c = x["Close"]
+    if isinstance(x.index, pd.DatetimeIndex) and len(set(x.index.date[-500:])) > 1 and \
+            (x.index[-1] - x.index[-2]) < pd.Timedelta(hours=20):
+        dates = x.index.date
+        prev = c[dates < dates[-1]]
+        if len(prev):
+            return float((c.iloc[-1] / prev.iloc[-1] - 1) * 100)
+    return float((c.iloc[-1] / c.iloc[-2] - 1) * 100)
+
+
+def quick_scan(tickers: list[str], s: Settings, progress=None) -> pd.DataFrame:
+    """Analyse many tickers (no info call, shared market regime) and rank them."""
+    market = D.market_regime() if s.use_market else None
+    rows = []
+    for i, t in enumerate(tickers):
+        if progress:
+            progress(i / len(tickers), t)
+        try:
+            r = analyze(t, s, market=market, with_info=False)
+            x = r.frame
+            rows.append({
+                "מניה": r.ticker, "מחיר": round(r.price, 2),
+                "שינוי יומי %": round(day_change(x), 2),
+                "סיכוי עלייה %": round(r.p_up * 100, 1), "המלצה": r.action,
+                "AUC מודל": round(r.model["auc"], 3) if not np.isnan(r.model["auc"]) else None,
+                "ציון טכני": round(r.tech_score, 2),
+                "סנטימנט": round(r.news["score"], 2) if r.news else None,
+                "RSI": round(float(x["rsi"].iloc[-1]), 1),
+                "נפח יחסי": round(float(x["vol_ratio"].iloc[-1]), 2),
+                "סטופ": round(r.levels["stop"], 2), "יעד": round(r.levels["target"], 2),
+            })
+        except Exception as e:
+            rows.append({"מניה": t, "המלצה": f"שגיאה: {str(e)[:60]}"})
+    if progress:
+        progress(1.0, "")
+    df = pd.DataFrame(rows)
+    if "סיכוי עלייה %" in df:
+        df["חוזק אות"] = (df["סיכוי עלייה %"] - 50).abs()
+        df = df.sort_values("חוזק אות", ascending=False).drop(columns="חוזק אות")
+    return df
