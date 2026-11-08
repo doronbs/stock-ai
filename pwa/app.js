@@ -332,7 +332,8 @@ function renderScan() {
     const p = r["סיכוי עלייה %"], lvl = p >= Math.max(S.buy * 100 + 10, 70) ? "strong_buy" : p >= S.buy * 100 ? "buy" :
       p <= Math.min(S.sell * 100 - 10, 30) ? "strong_sell" : p <= S.sell * 100 ? "sell" : "hold";
     const ext = r["מוקדם/מאוחר %"];
-    return `<div class="scanrow" data-t="${esc(r["מניה"])}">
+    const hot = p >= 60 ? ' style="background:rgba(34,197,94,.18);border-color:#22c57a"' : "";
+    return `<div class="scanrow" data-t="${esc(r["מניה"])}"${hot}>
       <div><div class="t">${esc(r["מניה"])}</div><div class="small muted ltr">${fmt(r["מחיר"])}</div></div>
       <div><div class="small"><span class="${cls(r["שינוי יומי %"])}">${pct(r["שינוי יומי %"])}</span>
         ${ext != null ? ` · מוקדם <span class="${cls(ext)}">${pct(ext)}</span>` : ""} · AUC ${fmt(r["AUC מודל"], 2)}</div>

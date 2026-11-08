@@ -406,15 +406,21 @@ with tab_s:
         wl = presets[preset]
         st.caption("ייסרקו: " + ", ".join(wl) + " — לחץ ▶️ הרץ סריקה")
     def style_scan(df):
-        def color(v):
-            if not isinstance(v, (int, float)) or pd.isna(v):
-                return ""
-            if v >= buy_th * 100:
-                return "background-color: rgba(47,180,90,.35)"
-            if v <= sell_th * 100:
+        """Whole row green when P(up) >= 60%; probability cell red at/below the sell threshold."""
+        if "סיכוי עלייה %" not in df:
+            return df
+
+        def row_color(row):
+            p = row.get("סיכוי עלייה %")
+            if isinstance(p, (int, float)) and not pd.isna(p) and p >= 60:
+                return ["background-color: rgba(34,197,94,.30); font-weight: 600"] * len(row)
+            return [""] * len(row)
+
+        def sell_cell(v):
+            if isinstance(v, (int, float)) and not pd.isna(v) and v <= sell_th * 100:
                 return "background-color: rgba(224,87,59,.35)"
             return ""
-        return df.style.map(color, subset=["סיכוי עלייה %"]) if "סיכוי עלייה %" in df else df
+        return df.style.apply(row_color, axis=1).map(sell_cell, subset=["סיכוי עלייה %"])
 
     if run_scan and wl:
         # Progressive display: each stock appears (re-ranked) as soon as it's analysed
