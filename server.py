@@ -27,7 +27,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from engine import data as D
-from engine.analyzer import Settings, analyze, day_change, quick_scan
+from engine.analyzer import Settings, analyze, day_change, quick_scan, rank
 from engine.premarket import CLOSE, OPEN, SESSION_HE, market_session
 from engine.sentiment import analyze_news
 from engine.universe import GROUPS
@@ -199,9 +199,13 @@ def _run_scan(job_id: str, tickers: list[str], s: Settings):
 
     def prog(p, t):
         job["progress"], job["current"] = p, t
+
+    def partial(rows):
+        job["rows"] = rank(rows).replace({np.nan: None}).to_dict("records")
+        job["done"] = len(rows)
     try:
-        df = quick_scan(tickers, s, progress=prog)
-        job["rows"] = df.replace({np.nan: None}).to_dict("records")
+        job["current"] = tickers[0]
+        quick_scan(tickers, s, progress=prog, on_row=partial)
         job["status"] = "done"
     except Exception as e:
         job["status"], job["error"] = "error", str(e)
@@ -218,6 +222,7 @@ async def api_scan_start(req: Request):
     s.use_mtf = False  # faster scans
     job_id = uuid.uuid4().hex[:10]
     _jobs[job_id] = {"status": "running", "progress": 0.0, "current": "", "n": len(tickers),
+                     "rows": [], "done": 0,
                      "started": time.time()}
     threading.Thread(target=_run_scan, args=(job_id, tickers, s), daemon=True).start()
     # forget old jobs

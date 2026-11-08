@@ -379,14 +379,7 @@ with tab_s:
     if preset != "—":
         wl = presets[preset]
         st.caption("ייסרקו: " + ", ".join(wl) + " — לחץ ▶️ הרץ סריקה")
-    if run_scan:
-        bar = st.progress(0.0, "מתחיל...")
-        df = quick_scan(wl, settings, progress=lambda p, t: bar.progress(min(p, 1.0), f"מנתח {t}..."))
-        bar.empty()
-        ss["scan"] = df
-    if "scan" in ss:
-        df = ss["scan"]
-
+    def style_scan(df):
         def color(v):
             if not isinstance(v, (int, float)) or pd.isna(v):
                 return ""
@@ -395,9 +388,25 @@ with tab_s:
             if v <= sell_th * 100:
                 return "background-color: rgba(224,87,59,.35)"
             return ""
-        sty = df.style.map(color, subset=["סיכוי עלייה %"]) if "סיכוי עלייה %" in df else df
-        st.dataframe(sty, use_container_width=True, hide_index=True, height=560)
+        return df.style.map(color, subset=["סיכוי עלייה %"]) if "סיכוי עלייה %" in df else df
+
+    if run_scan and wl:
+        # Progressive display: each stock appears (re-ranked) as soon as it's analysed
+        bar = st.progress(0.0, f"מנתח {wl[0]}... (0/{len(wl)})")
+        table = st.empty()
+        rows = []
+        market = D.market_regime() if settings.use_market else None
+        from engine.analyzer import rank, scan_row
+        for i, t in enumerate(wl):
+            rows.append(scan_row(t, settings, market))
+            nxt = f"מנתח {wl[i + 1]}... ({i + 1}/{len(wl)})" if i + 1 < len(wl) else f"הסתיים ✅ ({len(wl)}/{len(wl)})"
+            bar.progress((i + 1) / len(wl), nxt)
+            table.dataframe(style_scan(rank(rows)), use_container_width=True, hide_index=True, height=560)
+        ss["scan"] = rank(rows)
         st.caption("ממוין לפי חוזק האיתות (מרחק מ-50%). שים לב לעמודת AUC – מעל 0.55 = למודל יש יתרון מוכח במניה זו.")
+    elif "scan" in ss:
+        st.dataframe(style_scan(ss["scan"]), use_container_width=True, hide_index=True, height=560)
+        st.caption("תוצאות הסריקה האחרונה. ממוין לפי חוזק האיתות (מרחק מ-50%).")
 
 
 # ───── Market trends ─────

@@ -1,5 +1,5 @@
 // StockAI service worker: app shell offline, API always from network.
-const CACHE = "stockai-v3";
+const CACHE = "stockai-v4";
 const SHELL = ["/", "/static/app.js", "/static/style.css", "/manifest.webmanifest",
   "/static/icons/icon-192.png", "/static/icons/apple-touch-icon.png",
   "https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"];

@@ -273,35 +273,52 @@ def day_change(x: pd.DataFrame) -> float:
     return float((c.iloc[-1] / c.iloc[-2] - 1) * 100)
 
 
-def quick_scan(tickers: list[str], s: Settings, progress=None) -> pd.DataFrame:
-    """Analyse many tickers (no info call, shared market regime) and rank them."""
+def scan_row(t: str, s: Settings, market: dict | None) -> dict:
+    """Analyse one ticker for the scanner and return a table row."""
+    try:
+        r = analyze(t, s, market=market, with_info=False)
+        x = r.frame
+        return {
+            "מניה": r.ticker, "מחיר": round(r.price, 2),
+            "שינוי יומי %": round(day_change(x), 2),
+            "מוקדם/מאוחר %": round(r.premarket["ext_change_%"], 2)
+            if r.premarket and r.session in ("premarket", "afterhours") else None,
+            "סיכוי עלייה %": round(r.p_up * 100, 1), "המלצה": r.action,
+            "AUC מודל": round(r.model["auc"], 3) if not np.isnan(r.model["auc"]) else None,
+            "ציון טכני": round(r.tech_score, 2),
+            "סנטימנט": round(r.news["score"], 2) if r.news else None,
+            "RSI": round(float(x["rsi"].iloc[-1]), 1),
+            "נפח יחסי": round(float(x["vol_ratio"].iloc[-1]), 2),
+            "סטופ": round(r.levels["stop"], 2), "יעד": round(r.levels["target"], 2),
+        }
+    except Exception as e:
+        return {"מניה": t.upper(), "המלצה": f"שגיאה: {str(e)[:60]}"}
+
+
+def scan_iter(tickers: list[str], s: Settings):
+    """Yield (index, row) as soon as each ticker is done – for live/progressive display."""
     market = D.market_regime() if s.use_market else None
-    rows = []
     for i, t in enumerate(tickers):
-        if progress:
-            progress(i / len(tickers), t)
-        try:
-            r = analyze(t, s, market=market, with_info=False)
-            x = r.frame
-            rows.append({
-                "מניה": r.ticker, "מחיר": round(r.price, 2),
-                "שינוי יומי %": round(day_change(x), 2),
-                "מוקדם/מאוחר %": round(r.premarket["ext_change_%"], 2)
-                if r.premarket and r.session in ("premarket", "afterhours") else None,
-                "סיכוי עלייה %": round(r.p_up * 100, 1), "המלצה": r.action,
-                "AUC מודל": round(r.model["auc"], 3) if not np.isnan(r.model["auc"]) else None,
-                "ציון טכני": round(r.tech_score, 2),
-                "סנטימנט": round(r.news["score"], 2) if r.news else None,
-                "RSI": round(float(x["rsi"].iloc[-1]), 1),
-                "נפח יחסי": round(float(x["vol_ratio"].iloc[-1]), 2),
-                "סטופ": round(r.levels["stop"], 2), "יעד": round(r.levels["target"], 2),
-            })
-        except Exception as e:
-            rows.append({"מניה": t, "המלצה": f"שגיאה: {str(e)[:60]}"})
-    if progress:
-        progress(1.0, "")
+        yield i, scan_row(t, s, market)
+
+
+def rank(rows: list[dict]) -> pd.DataFrame:
+    """Sort scanner rows by signal strength (distance from 50%); errors at the bottom."""
     df = pd.DataFrame(rows)
     if "סיכוי עלייה %" in df:
-        df["חוזק אות"] = (df["סיכוי עלייה %"] - 50).abs()
-        df = df.sort_values("חוזק אות", ascending=False).drop(columns="חוזק אות")
+        df["_k"] = (df["סיכוי עלייה %"] - 50).abs().fillna(-1)
+        df = df.sort_values("_k", ascending=False).drop(columns="_k")
     return df
+
+
+def quick_scan(tickers: list[str], s: Settings, progress=None, on_row=None) -> pd.DataFrame:
+    """Analyse many tickers and rank them. `on_row(rows_so_far)` is called after each ticker."""
+    rows = []
+    n = len(tickers)
+    for i, row in scan_iter(tickers, s):
+        rows.append(row)
+        if progress:
+            progress((i + 1) / n, tickers[i + 1] if i + 1 < n else "")
+        if on_row:
+            on_row(rows)
+    return rank(rows)

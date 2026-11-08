@@ -302,15 +302,16 @@ $("#groupChips").addEventListener("click", e => {
 $("#scanBtn").addEventListener("click", async () => {
   const list = $("#scanList").value; S.scanList = list; save();
   if (!list.trim()) return toast("בחר קבוצה או הזן מניות");
-  $("#scanBtn").disabled = true; $("#scanProgress").classList.remove("hidden"); $("#scanResults").innerHTML = "";
+  $("#scanBtn").disabled = true; $("#scanProgress").classList.remove("hidden"); $("#scanResults").innerHTML = ""; scanRows = [];
   try {
     const {job} = await api("scan", {tickers: list, ...baseParams()});
     for (;;) {
-      await new Promise(res => setTimeout(res, 1500));
+      await new Promise(res => setTimeout(res, 1000));
       const st = await api("scan/status", {job});
       $("#scanBar").style.width = (st.progress * 100).toFixed(0) + "%";
-      $("#scanText").textContent = st.status === "running" ? `מנתח ${st.current}… (${Math.round(st.progress * st.n)}/${st.n})` : "";
-      if (st.status === "done") { scanRows = st.rows; renderScan(); break; }
+      $("#scanText").textContent = st.status === "running" ? `מנתח ${st.current}… (${st.done || 0}/${st.n}) – התוצאות מתעדכנות תוך כדי` : "";
+      if ((st.rows || []).length !== scanRows.length || st.status === "done") { scanRows = st.rows || []; renderScan(); }
+      if (st.status === "done") break;
       if (st.status === "error") throw new Error(st.error);
     }
   } catch (e) { $("#scanResults").innerHTML = `<div class="err">⚠️ ${esc(e.message)}</div>`; }
@@ -339,7 +340,7 @@ function renderScan() {
       <div style="text-align:center"><div style="font-weight:800">${fmt(p, 0)}%</div><span class="pill" style="background:${COLORS[lvl]}">${esc(r["המלצה"])}</span></div>
     </div>`;
   }).join("") + (errs.length ? `<p class="small muted">לא נותחו: ${errs.map(r => esc(r["מניה"])).join(", ")}</p>` : "")
-    + (rows.length ? "" : `<p class="muted">אין תוצאות בסינון הזה</p>`);
+    + (rows.length || !scanRows.length ? "" : `<p class="muted">אין תוצאות בסינון הזה</p>`);
 }
 $("#scanResults").addEventListener("click", e => { const r = e.target.closest("[data-t]"); if (r) runAnalyze(r.dataset.t); });
 
