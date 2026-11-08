@@ -24,11 +24,20 @@ DEFAULT_CONFIG = {
 }
 
 
-def load_config() -> dict:
+def config_path(user: str | None = None) -> Path:
+    """settings.json for the local/monitor install; settings_<user>.json per app user."""
+    if user:
+        return CONFIG_PATH.with_name(f"settings_{user}.json")
+    return CONFIG_PATH
+
+
+def load_config(user: str | None = None) -> dict:
     cfg = dict(DEFAULT_CONFIG)
+    cfg["watchlist"] = list(DEFAULT_CONFIG["watchlist"])
+    path = config_path(user)
     try:
-        if CONFIG_PATH.exists():
-            cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+        if path.exists():
+            cfg.update(json.loads(path.read_text(encoding="utf-8")))
     except Exception:
         pass
     cfg["telegram_token"] = os.getenv("TELEGRAM_TOKEN", cfg["telegram_token"])
@@ -36,8 +45,8 @@ def load_config() -> dict:
     return cfg
 
 
-def save_config(cfg: dict) -> None:
-    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+def save_config(cfg: dict, user: str | None = None) -> None:
+    config_path(user).write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def send_telegram(text: str, cfg: dict | None = None) -> bool:

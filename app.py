@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 import uuid
@@ -67,9 +68,31 @@ BAR_MIN = {"1m": 1, "2m": 2, "5m": 5, "15m": 15, "30m": 30, "60m": 60, "90m": 90
 INTERVAL_LABEL = {"1m": "דקה", "2m": "2 דקות", "5m": "5 דקות", "15m": "15 דקות",
                   "30m": "30 דקות", "60m": "שעה", "1d": "יומי", "1wk": "שבועי"}
 
-cfg = load_config()
 ss = st.session_state
 ss.setdefault("last_action", {})
+
+
+# ───────────── Per-user separation ─────────────
+# Each person picks a short user name once. It lives in the page address (?u=name), so the
+# home-screen icon keeps it, and scans/settings/watchlist are kept separately per user.
+def _clean_user(v) -> str:
+    v = re.sub(r"[^a-z0-9_-]", "", str(v or "").lower())[:20]
+    return v
+
+
+USER = _clean_user(st.query_params.get("u"))
+if USER:
+    ss["user"] = USER
+elif ss.get("user"):
+    USER = ss["user"]
+    try:
+        st.query_params["u"] = USER
+    except Exception:
+        pass
+if not USER:
+    ss.setdefault("guest_id", "guest-" + uuid.uuid4().hex[:6])
+OWNER = USER or ss["guest_id"]          # who owns scans in this session
+cfg = load_config(USER or None) if USER else load_config("__guest__")
 
 
 def horizon_text(interval: str, bars: int) -> str:
@@ -83,6 +106,12 @@ def horizon_text(interval: str, bars: int) -> str:
 
 # ───────────────────────────── Sidebar ─────────────────────────────
 with st.sidebar:
+    if USER:
+        st.markdown(f"👤 **משתמש:** `{USER}`")
+        if st.button("החלף משתמש", key="switch_user"):
+            ss.pop("user", None)
+            st.query_params.clear()
+            st.rerun()
     st.title("📈 StockAI")
     interval = st.selectbox("אינטרוול גרף", list(INTERVAL_LABEL),
                             index=list(INTERVAL_LABEL).index(cfg["interval"]),
@@ -115,8 +144,11 @@ with st.sidebar:
         cfg.update(interval=interval, horizon=horizon, buy_th=buy_th, sell_th=sell_th,
                    refresh_minutes=refresh, telegram_token=tg_tok, telegram_chat_id=tg_chat,
                    alert_min_prob=alert_p)
-        save_config(cfg)
-        st.success("נשמר")
+        if USER:
+            save_config(cfg, USER)
+            st.success("נשמר")
+        else:
+            st.warning("כדי לשמור, בחר קודם שם משתמש (למעלה במסך הראשי)")
     from engine.premarket import SESSION_HE, market_session
     _sess = market_session()
     _icon = {"regular": "🟢", "premarket": "🟡", "afterhours": "🟠", "closed": "🔴"}[_sess]
@@ -222,6 +254,26 @@ def fmt_big(n):
 
 
 # ───────────────────────────── Tabs ─────────────────────────────
+if not USER:
+    with st.container(border=True):
+        st.markdown("#### 👤 בחר שם משתמש (פעם אחת)")
+        st.caption("כך הסריקות, ההגדרות ורשימת המעקב שלך נשמרות רק לך ולא מתערבבות עם משתמשים אחרים. "
+                   "באנגלית בלבד, למשל doron. אפשר גם לדלג ולהשתמש כאורח (בלי שמירה).")
+        u1, u2 = st.columns([3, 1])
+        new_user = u1.text_input("שם משתמש", key="new_user", label_visibility="collapsed",
+                                 placeholder="שם משתמש באנגלית")
+        if u2.button("שמור", type="primary", use_container_width=True, key="save_user"):
+            nu = _clean_user(new_user)
+            if nu:
+                ss["user"] = nu
+                st.query_params["u"] = nu
+                st.rerun()
+            else:
+                st.error("רק אותיות באנגלית / ספרות")
+elif ss.get("_user_tip") is None:
+    ss["_user_tip"] = True
+    st.toast(f"מחובר כ-{USER}. כדי שהאייקון במסך הבית יזכור אותך, הוסף אותו מחדש מהדף הזה.", icon="👤")
+
 tab_a, tab_s, tab_m, tab_n, tab_b, tab_h = st.tabs(
     ["📈 ניתוח מניה", "🔎 סורק מניות", "🌎 מגמות שוק", "📰 חדשות", "🧪 בדיקה היסטורית", "❓ איך זה עובד"])
 
@@ -397,18 +449,19 @@ with tab_a:
 def scan_store():
     """Process-wide store: scans keep running on the server even when the phone app is
     in the background or closed, and results are there when you come back."""
-    return {"jobs": {}, "last": None, "lock": threading.Lock()}
+    return {"jobs": {}, "last_by": {}, "lock": threading.Lock()}
 
 
-def start_scan_job(store, tickers, s):
+def start_scan_job(store, tickers, s, owner):
     jid = uuid.uuid4().hex[:8]
     job = {"status": "running", "rows": [], "n": len(tickers), "done": 0, "current": tickers[0],
-           "started": time.time(), "finished": None, "cancel": False, "tickers": list(tickers)}
+           "started": time.time(), "finished": None, "cancel": False, "tickers": list(tickers),
+           "owner": owner}
     with store["lock"]:
         for k in [k for k, v in store["jobs"].items() if time.time() - v["started"] > 6 * 3600]:
             store["jobs"].pop(k, None)
         store["jobs"][jid] = job
-        store["last"] = jid
+        store["last_by"][owner] = jid
 
     def run():
         try:
@@ -461,8 +514,11 @@ with tab_s:
     run_scan = cc1.button("▶️ הרץ סריקה", type="primary")
     if cc2.button("💾 שמור רשימה"):
         cfg["watchlist"] = wl
-        save_config(cfg)
-        st.success("נשמר")
+        if USER:
+            save_config(cfg, USER)
+            st.success("נשמר")
+        else:
+            st.warning("כדי לשמור, בחר קודם שם משתמש (למעלה במסך הראשי)")
     preset = cc3.selectbox("או טען קבוצה מוכנה", ["—"] + list(GROUPS))
     presets = GROUPS
     if preset != "—":
@@ -487,15 +543,17 @@ with tab_s:
 
     store = scan_store()
     if run_scan and wl:
-        jid = start_scan_job(store, wl, settings)
+        jid = start_scan_job(store, wl, settings, OWNER)
         ss["scan_job"] = jid
         try:
             st.query_params["scan"] = jid
         except Exception:
             pass
     # Find the job: this session → URL → most recent job on the server (survives app switch/close)
-    jid = ss.get("scan_job") or st.query_params.get("scan") or store.get("last")
+    jid = ss.get("scan_job") or st.query_params.get("scan") or store["last_by"].get(OWNER)
     job = store["jobs"].get(jid) if jid else None
+    if job and job.get("owner") != OWNER:      # never show someone else's scan
+        job = None
     if job:
         ss["scan_job"] = jid
         if job["status"] == "running":
