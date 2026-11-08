@@ -25,13 +25,15 @@ def main():
     ap.add_argument("--min-prob", type=float, default=cfg["alert_min_prob"],
                     help="alert when P(up)>=x or P(up)<=1-x")
     ap.add_argument("--always", action="store_true", help="scan even when US market is closed")
+    ap.add_argument("--regular-only", action="store_true",
+                    help="skip pre-market / after-hours (default: scan 04:00-20:00 New York)")
     a = ap.parse_args()
 
     s = Settings(interval=a.interval, horizon=a.horizon, buy_th=cfg["buy_th"], sell_th=cfg["sell_th"])
     last_signal: dict[str, str] = {}
     print(f"StockAI monitor | {len(a.tickers)} tickers | every {a.every} min | {a.interval} | H={a.horizon}")
     while True:
-        if not a.always and not D.is_market_open():
+        if not a.always and not D.is_market_open(extended=not a.regular_only):
             print(datetime.now().strftime("%H:%M"), "השוק האמריקאי סגור – ממתין...")
             time.sleep(300)
             continue
@@ -42,7 +44,10 @@ def main():
             except Exception as e:
                 print(f"{t}: error {e}")
                 continue
-            print(f"{datetime.now():%H:%M:%S} {t:6} {r.price:10.2f}  P(up)={r.p_up * 100:5.1f}%  {r.action}")
+            ext = ""
+            if r.premarket and r.session in ("premarket", "afterhours"):
+                ext = f"  [{r.session}: {r.premarket['ext_change_%']:+.2f}%]"
+            print(f"{datetime.now():%H:%M:%S} {t:6} {r.price:10.2f}  P(up)={r.p_up * 100:5.1f}%  {r.action}{ext}")
             strong = r.p_up >= a.min_prob or r.p_up <= 1 - a.min_prob
             if strong and last_signal.get(t) != r.action_level:
                 msg = format_alert(r)

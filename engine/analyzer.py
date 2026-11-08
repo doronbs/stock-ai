@@ -9,6 +9,7 @@ import pandas as pd
 from . import data as D
 from . import indicators as I
 from .model import train_and_predict
+from .premarket import market_session, premarket_analysis
 from .sentiment import analyze_news
 
 
@@ -21,11 +22,13 @@ class Settings:
     use_news: bool = True
     use_market: bool = True
     use_mtf: bool = True
-    prepost: bool = False
+    prepost: bool = True         # show extended hours on the chart
+    use_premarket: bool = True   # pre-market / after-hours analysis layer
     w_news: float = 0.35         # logit weights of the adjustment layers
     w_market: float = 0.15
     w_tech: float = 0.25
     w_mtf: float = 0.20
+    w_pm: float = 0.50
 
 
 @dataclass
@@ -46,6 +49,9 @@ class Result:
     frame: pd.DataFrame
     info: dict = field(default_factory=dict)
     breakdown: dict = field(default_factory=dict)
+    session: str = "regular"
+    premarket: dict | None = None
+    last_close: float = 0.0
 
 
 def _logit(p):
@@ -146,8 +152,9 @@ def higher_timeframe(ticker: str, interval: str) -> dict | None:
     return {"score": max(-1, min(1, s)), "notes": notes, "interval": hi}
 
 
-def trade_levels(x: pd.DataFrame, direction: int, supports, resistances) -> dict:
-    c = float(x["Close"].iloc[-1])
+def trade_levels(x: pd.DataFrame, direction: int, supports, resistances,
+                 price: float | None = None) -> dict:
+    c = float(price if price is not None else x["Close"].iloc[-1])
     a = float(x["atr"].iloc[-1])
     if direction >= 0:
         stop = c - 1.5 * a
@@ -172,8 +179,11 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
             with_info: bool = True) -> Result:
     ticker = ticker.upper().strip()
     intraday = s.interval in D.INTRADAY
-    raw = D.get_history(ticker, s.interval, prepost=s.prepost)
+    # The model always trains on regular-session bars (cleaner, liquid data);
+    # extended hours are handled by the dedicated pre-market layer below.
+    raw = D.get_history(ticker, s.interval, prepost=False)
     x = I.add_all(raw, intraday)
+    session = market_session()
 
     model = train_and_predict(x, intraday, s.horizon, s.buy_th, s.sell_th)
     tech, reasons = technical_votes(x)
@@ -212,6 +222,16 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
         t_adj = s.w_mtf * mtf["score"] * trust
         adj += t_adj
         br["טווח זמן גבוה"] = t_adj
+    pm = None
+    if s.use_premarket and intraday:
+        try:
+            pm = premarket_analysis(ticker, session)
+        except Exception:
+            pm = None
+    if pm and pm["active"] and pm["signal"]:
+        pm_adj = s.w_pm * pm["signal"]
+        adj += pm_adj
+        br["מסחר מוקדם / פער"] = pm_adj
     pat_adj = 0.08 * sum(d for _, d in patterns)
     adj += pat_adj
     if pat_adj:
@@ -229,8 +249,13 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
     else:
         action, lvl = "המתן / ניטרלי", "hold"
 
-    levels = trade_levels(x, 1 if p >= 0.5 else -1, supports, resistances)
-    return Result(ticker=ticker, price=float(x["Close"].iloc[-1]), p_up=p, action=action,
+    last_close = float(x["Close"].iloc[-1])
+    price = last_close
+    if pm and session in ("premarket", "afterhours", "closed"):
+        price = pm["last_price"]          # live extended-hours price
+    levels = trade_levels(x, 1 if p >= 0.5 else -1, supports, resistances, price)
+    return Result(ticker=ticker, price=price, last_close=last_close, session=session,
+                  premarket=pm, p_up=p, action=action,
                   action_level=lvl, model=model, tech_score=tech, tech_reasons=reasons,
                   news=news, market=market, mtf=mtf, levels=levels, patterns=patterns,
                   frame=x, info=info, breakdown=br)
@@ -261,6 +286,8 @@ def quick_scan(tickers: list[str], s: Settings, progress=None) -> pd.DataFrame:
             rows.append({
                 "מניה": r.ticker, "מחיר": round(r.price, 2),
                 "שינוי יומי %": round(day_change(x), 2),
+                "מוקדם/מאוחר %": round(r.premarket["ext_change_%"], 2)
+                if r.premarket and r.session in ("premarket", "afterhours") else None,
                 "סיכוי עלייה %": round(r.p_up * 100, 1), "המלצה": r.action,
                 "AUC מודל": round(r.model["auc"], 3) if not np.isnan(r.model["auc"]) else None,
                 "ציון טכני": round(r.tech_score, 2),

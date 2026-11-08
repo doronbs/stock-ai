@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<title>StockAI</title>
+<meta name="theme-color" content="#0b1220">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="StockAI">
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="stylesheet" href="/static/style.css">
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">📈 StockAI</div>
+  <div id="sessionBadge" class="badge">…</div>
+</header>
+
+<main>
+  <!-- ANALYZE -->
+  <section id="v-analyze" class="view">
+    <form id="searchForm" class="search">
+      <input id="tickerInput" list="tickerList" autocomplete="off" autocapitalize="characters"
+             spellcheck="false" placeholder="סימול מניה, למשל NVDA">
+      <datalist id="tickerList"></datalist>
+      <button type="submit" class="btn primary">נתח</button>
+    </form>
+    <div class="chips" id="intervalChips"></div>
+    <div class="row small muted" id="horizonRow">
+      <span>אופק:</span>
+      <input type="range" id="horizonRange" min="1" max="60">
+      <span id="horizonText"></span>
+    </div>
+    <div id="analysis"></div>
+  </section>
+
+  <!-- SCAN -->
+  <section id="v-scan" class="view hidden">
+    <h2>🔎 סורק מניות</h2>
+    <div class="chips wrap" id="groupChips"></div>
+    <textarea id="scanList" rows="3" placeholder="או הדבק רשימה מופרדת בפסיקים"></textarea>
+    <button id="scanBtn" class="btn primary block">▶️ סרוק</button>
+    <div id="scanProgress" class="hidden"><div class="bar"><i id="scanBar"></i></div>
+      <div class="small muted" id="scanText"></div></div>
+    <div class="chips" id="scanFilter"></div>
+    <div id="scanResults"></div>
+  </section>
+
+  <!-- MARKET -->
+  <section id="v-market" class="view hidden"><div id="market"></div></section>
+
+  <!-- NEWS -->
+  <section id="v-news" class="view hidden"><div id="news"></div></section>
+
+  <!-- SETTINGS -->
+  <section id="v-settings" class="view hidden">
+    <h2>⚙️ הגדרות</h2>
+    <div class="card">
+      <label>סף קנייה <input type="number" step="0.01" min="0.5" max="0.95" id="s-buy"></label>
+      <label>סף מכירה <input type="number" step="0.01" min="0.05" max="0.5" id="s-sell"></label>
+      <label>רענון אוטומטי (דקות, 0 = כבוי)
+        <select id="s-refresh"><option>0</option><option>1</option><option>2</option><option>3</option>
+          <option>5</option><option>10</option><option>15</option><option>30</option><option>60</option></select></label>
+    </div>
+    <div class="card">
+      <label class="sw"><input type="checkbox" id="s-pm"> ניתוח מסחר מוקדם / פערים</label>
+      <label class="sw"><input type="checkbox" id="s-news"> סנטימנט חדשות</label>
+      <label class="sw"><input type="checkbox" id="s-market"> מצב השוק (SPY / VIX)</label>
+      <label class="sw"><input type="checkbox" id="s-mtf"> אישור מטווח זמן גבוה</label>
+      <label class="sw"><input type="checkbox" id="s-notify"> התראות על איתות חדש</label>
+    </div>
+    <div class="card" id="keyCard">
+      <label>קוד גישה (אם הוגדר בשרת) <input type="password" id="s-key" autocomplete="off"></label>
+    </div>
+    <button id="saveSettings" class="btn primary block">שמור</button>
+    <div class="card small muted">
+      <b>התקנה באייפון:</b> פתח ב-Safari ← כפתור השיתוף ⬆️ ← "הוסף למסך הבית".<br>
+      ⚠️ כלי עזר לניתוח בלבד – לא ייעוץ השקעות. הסתברות היא הערכה סטטיסטית, לא ודאות.
+    </div>
+  </section>
+</main>
+
+<nav class="tabs">
+  <a href="#analyze" data-v="analyze"><span>📈</span>ניתוח</a>
+  <a href="#scan" data-v="scan"><span>🔎</span>סורק</a>
+  <a href="#market" data-v="market"><span>🌎</span>שוק</a>
+  <a href="#news" data-v="news"><span>📰</span>חדשות</a>
+  <a href="#settings" data-v="settings"><span>⚙️</span>הגדרות</a>
+</nav>
+<div id="toast" class="toast hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

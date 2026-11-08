@@ -71,4 +71,6 @@ def format_alert(r) -> str:
             f"מחיר: {r.price:.2f} | סטופ: {lv['stop']:.2f} | יעד: {lv['target']:.2f} "
             f"(R:R {lv['rr']:.1f})\n"
             f"דיוק מודל היסטורי (AUC): {r.model['auc']:.3f}\n"
+            + (f"מסחר מוקדם/מאוחר: {r.premarket['ext_change_%']:+.2f}%\n"
+               if r.premarket and r.session in ("premarket", "afterhours") else "")
             + "\n".join(r.tech_reasons[:3]))

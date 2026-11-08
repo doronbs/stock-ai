@@ -234,7 +234,10 @@ def market_regime() -> dict:
     return out
 
 
-def is_market_open(now: datetime | None = None) -> bool:
+def is_market_open(now: datetime | None = None, extended: bool = False) -> bool:
+    if extended:
+        from .premarket import market_session
+        return market_session(now) != "closed"
     now = now or datetime.now(timezone.utc)
     ny = pd.Timestamp(now).tz_convert("America/New_York")
     if ny.weekday() >= 5:

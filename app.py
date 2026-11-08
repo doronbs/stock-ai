@@ -15,6 +15,7 @@ from plotly.subplots import make_subplots
 from engine import data as D
 from engine.alerts import format_alert, load_config, save_config, send_telegram
 from engine.analyzer import Settings, analyze, day_change, quick_scan
+from engine.universe import GROUPS
 
 st.set_page_config(page_title="StockAI – ניתוח מניות", page_icon="📈", layout="wide")
 
@@ -71,7 +72,8 @@ with st.sidebar:
         use_news = st.checkbox("סנטימנט חדשות", True)
         use_market = st.checkbox("מצב השוק הכללי (SPY/VIX)", True)
         use_mtf = st.checkbox("אישור מטווח זמן גבוה", True)
-        prepost = st.checkbox("כולל מסחר לפני/אחרי שעות", False)
+        use_pm = st.checkbox("ניתוח מסחר מוקדם / פערים", True)
+        prepost = st.checkbox("הצג מסחר מוקדם ומאוחר בגרף", True)
     with st.expander("התראות טלגרם"):
         tg_tok = st.text_input("Bot token", cfg["telegram_token"], type="password")
         tg_chat = st.text_input("Chat ID", cfg["telegram_chat_id"])
@@ -88,23 +90,50 @@ with st.sidebar:
                    alert_min_prob=alert_p)
         save_config(cfg)
         st.success("נשמר")
-    mo = D.is_market_open()
-    st.markdown(f"**שוק ארה\"ב:** {'🟢 פתוח' if mo else '🔴 סגור'}")
+    from engine.premarket import SESSION_HE, market_session
+    _sess = market_session()
+    _icon = {"regular": "🟢", "premarket": "🟡", "afterhours": "🟠", "closed": "🔴"}[_sess]
+    st.markdown(f"**שוק ארה\"ב:** {_icon} {SESSION_HE[_sess]}")
+    st.caption("מסחר מוקדם 11:00–16:30 · רגיל 16:30–23:00 · מאוחר 23:00–03:00 (שעון ישראל, משתנה בשבועות מעבר השעון)")
     st.caption("⚠️ כלי עזר לניתוח בלבד – לא ייעוץ השקעות. הסתברות היא הערכה סטטיסטית ולא ודאות.")
 
 settings = Settings(interval=interval, horizon=horizon, buy_th=buy_th, sell_th=sell_th,
-                    use_news=use_news, use_market=use_market, use_mtf=use_mtf, prepost=prepost)
+                    use_news=use_news, use_market=use_market, use_mtf=use_mtf, prepost=prepost,
+                    use_premarket=use_pm)
 tg_cfg = {"telegram_token": tg_tok, "telegram_chat_id": tg_chat}
 
 
 # ───────────────────────────── Charts ─────────────────────────────
 def price_chart(r) -> go.Figure:
     x = r.frame.tail(300 if interval in D.INTRADAY else 400)
+    ext = None
+    if prepost and interval in D.INTRADAY:
+        try:
+            e = D.get_history(r.ticker, interval, prepost=True)
+            e = e[e.index >= x.index[0]]
+            if e.index.tz is not None:
+                e = e.tz_convert("America/New_York")
+            t = e.index.time
+            from engine.premarket import CLOSE, OPEN
+            ext = e[(t < OPEN) | (t >= CLOSE)]
+        except Exception:
+            ext = None
     fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.02,
                         row_heights=[0.55, 0.13, 0.16, 0.16])
     fig.add_trace(go.Candlestick(x=x.index, open=x["Open"], high=x["High"], low=x["Low"],
                                  close=x["Close"], name="מחיר",
                                  increasing_line_color="#26a69a", decreasing_line_color="#ef5350"), 1, 1)
+    if ext is not None and len(ext):
+        fig.add_trace(go.Candlestick(x=ext.index, open=ext["Open"], high=ext["High"], low=ext["Low"],
+                                     close=ext["Close"], name="מסחר מוקדם/מאוחר",
+                                     increasing_line_color="#7fb3d5", decreasing_line_color="#c39bd3",
+                                     opacity=0.7), 1, 1)
+    pmd = r.premarket or {}
+    if "pm_high" in pmd:
+        fig.add_hline(y=pmd["pm_high"], line=dict(color="#f39c12", width=1, dash="dot"),
+                      annotation_text="שיא מוקדם", row=1, col=1)
+        fig.add_hline(y=pmd["pm_low"], line=dict(color="#f39c12", width=1, dash="dot"),
+                      annotation_text="שפל מוקדם", row=1, col=1)
     for col, color in [("ema9", "#f5a623"), ("ema21", "#4a90e2"), ("ema50", "#9b59b6"), ("ema200", "#555")]:
         if x[col].notna().any():
             fig.add_trace(go.Scatter(x=x.index, y=x[col], name=col.upper(), line=dict(width=1.2, color=color)), 1, 1)
@@ -135,7 +164,7 @@ def price_chart(r) -> go.Figure:
     if interval in D.INTRADAY and not prepost:
         fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"]), dict(bounds=[16, 9.5], pattern="hour")])
     elif interval in D.INTRADAY:
-        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"]), dict(bounds=[20, 4], pattern="hour")])
     else:
         fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     for i, t in enumerate(["", "נפח", "RSI", "MACD"], start=1):
@@ -203,7 +232,11 @@ def render_analysis():
     with sig:
         st.markdown(f"<div class='signal-box' style='background:{COLORS[r.action_level]}'>{r.action}</div>",
                     unsafe_allow_html=True)
-        st.metric("מחיר", f"{r.price:,.2f}", f"{day_change(r.frame):+.2f}% היום")
+        if r.premarket and r.session in ("premarket", "afterhours"):
+            st.metric(f"מחיר ({'מוקדם' if r.session == 'premarket' else 'מאוחר'})", f"{r.price:,.2f}",
+                      f"{r.premarket['ext_change_%']:+.2f}% מ{r.premarket['ref_label']}")
+        else:
+            st.metric("מחיר", f"{r.price:,.2f}", f"{day_change(r.frame):+.2f}% היום")
         auc = r.model["auc"]
         q = "גבוהה" if auc >= 0.58 else "בינונית" if auc >= 0.53 else "נמוכה – כמעט ללא יתרון"
         st.markdown(f"**אמינות המודל למניה זו:** {q}  \n<span class='small'>AUC={auc:.3f} | "
@@ -220,6 +253,30 @@ def render_analysis():
         b.metric("ATR", f"{L['atr']:.2f}")
         st.caption("תמיכות: " + ", ".join(f"{v:.2f}" for v in L["supports"][:3]) + "  \n"
                    "התנגדויות: " + ", ".join(f"{v:.2f}" for v in L["resistances"][:3]))
+
+    pmd = r.premarket
+    if pmd:
+        with st.container(border=True):
+            st.markdown(f"#### 🌅 {pmd['session_he']}"
+                        + ("" if pmd["active"] else " <span class='small'>(השכבה משפיעה על ההסתברות רק במסחר מוקדם ובשעה הראשונה)</span>"),
+                        unsafe_allow_html=True)
+            k = st.columns(5)
+            k[0].metric(pmd["ref_label"], f"{pmd['prev_close']:.2f}")
+            k[1].metric("פער", f"{pmd['gap_%']:+.2f}%")
+            if "pm_high" in pmd:
+                k[2].metric("שיא / שפל מוקדם", f"{pmd['pm_high']:.2f} / {pmd['pm_low']:.2f}")
+                k[3].metric("VWAP מוקדם", f"{pmd['pm_vwap']:.2f}")
+                rv = pmd.get("pm_rel_volume")
+                k[4].metric("נפח מוקדם יחסי", f"x{rv:.1f}" if rv else "—")
+            stt = pmd.get("stats", {})
+            if stt.get("n", 0):
+                st.write(f"**איך פערים דומים ({stt['range_%'][0]}%–{stt['range_%'][1]}%) התנהגו ב-2 השנים האחרונות** "
+                         f"({stt['n']} מקרים): המשיכו בכיוון הפער ב-**{stt['continuation'] * 100:.0f}%**, "
+                         f"נסגרו (חזרו לסגירה הקודמת) ב-**{stt['fill_rate'] * 100:.0f}%**, "
+                         f"שמרו על הפער עד הסגירה ב-**{stt['held_rate'] * 100:.0f}%**, "
+                         f"ממוצע פתיחה→סגירה **{stt['avg_open_to_close_%']:+.2f}%**")
+            for n_ in pmd["notes"]:
+                st.markdown(f"<div class='reason'>• {n_}</div>", unsafe_allow_html=True)
 
     st.plotly_chart(price_chart(r), use_container_width=True)
 
@@ -293,11 +350,8 @@ with tab_s:
         cfg["watchlist"] = wl
         save_config(cfg)
         st.success("נשמר")
-    preset = cc3.selectbox("או טען רשימה מוכנה", ["—", "מגה-קאפ טכנולוגיה", "שבבים", "פיננסים", "מומנטום/תנודתיות"])
-    presets = {"מגה-קאפ טכנולוגיה": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "ORCL", "NFLX"],
-               "שבבים": ["NVDA", "AMD", "AVGO", "TSM", "MU", "INTC", "QCOM", "ARM", "SMCI", "MRVL", "ASML"],
-               "פיננסים": ["JPM", "BAC", "GS", "MS", "WFC", "C", "V", "MA", "AXP", "COIN"],
-               "מומנטום/תנודתיות": ["PLTR", "COIN", "MSTR", "SMCI", "HOOD", "SOFI", "RIVN", "AFRM", "UPST", "IONQ"]}
+    preset = cc3.selectbox("או טען קבוצה מוכנה", ["—"] + list(GROUPS))
+    presets = GROUPS
     if preset != "—":
         wl = presets[preset]
         st.caption("סורק: " + ", ".join(wl))
