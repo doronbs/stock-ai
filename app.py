@@ -55,8 +55,6 @@ def horizon_text(interval: str, bars: int) -> str:
 # ───────────────────────────── Sidebar ─────────────────────────────
 with st.sidebar:
     st.title("📈 StockAI")
-    ticker = st.text_input("סימול מניה", value=ss.get("ticker", "NVDA")).upper().strip()
-    ss["ticker"] = ticker
     interval = st.selectbox("אינטרוול גרף", list(INTERVAL_LABEL),
                             index=list(INTERVAL_LABEL).index(cfg["interval"]),
                             format_func=lambda k: f"{k} – {INTERVAL_LABEL[k]}")
@@ -200,8 +198,8 @@ tab_a, tab_s, tab_m, tab_n, tab_b, tab_h = st.tabs(
 
 
 def render_analysis():
+    ticker = ss.get("active_ticker")
     if not ticker:
-        st.info("הזן סימול מניה")
         return
     try:
         with st.spinner(f"מנתח את {ticker}..."):
@@ -332,8 +330,34 @@ def render_analysis():
                             unsafe_allow_html=True)
 
 
+def stock_picker():
+    """Selection screen – nothing is analysed until the user presses Start."""
+    st.markdown("### 1️⃣ בחר מניה")
+    groups = ["✍️ הקלדה חופשית"] + list(GROUPS)
+    g = st.selectbox("קבוצה", groups, index=1, key="pick_group")
+    if g == groups[0]:
+        t = st.text_input("סימול מניה (למשל NVDA)", key="pick_free")
+    else:
+        opts = GROUPS[g]
+        t = st.radio("מניה", opts, horizontal=True, key=f"pick_{g}")
+    t = (t or "").upper().strip()
+    st.markdown("### 2️⃣ הפעל")
+    c1, c2 = st.columns(2)
+    if c1.button(f"▶️ Start – נתח {t}" if t else "▶️ Start", type="primary",
+                 use_container_width=True, disabled=not t):
+        ss["active_ticker"] = t
+    if c2.button("⏹ עצור", use_container_width=True, disabled=not ss.get("active_ticker")):
+        ss["active_ticker"] = None
+    st.caption(f"הגדרות: גרף {interval} · אופק {horizon_text(interval, horizon)} · "
+               f"רענון {'כבוי' if not refresh else f'כל {refresh} דק׳'} — לשינוי פתח את התפריט בצד (>>)")
+
+
 with tab_a:
-    if refresh:
+    stock_picker()
+    st.divider()
+    if not ss.get("active_ticker"):
+        st.info("👆 בחר מניה ולחץ **Start** כדי להתחיל את הניתוח")
+    elif refresh:
         st.fragment(run_every=refresh * 60)(render_analysis)()
     else:
         render_analysis()
@@ -354,8 +378,8 @@ with tab_s:
     presets = GROUPS
     if preset != "—":
         wl = presets[preset]
-        st.caption("סורק: " + ", ".join(wl))
-    if run_scan or preset != "—":
+        st.caption("ייסרקו: " + ", ".join(wl) + " — לחץ ▶️ הרץ סריקה")
+    if run_scan:
         bar = st.progress(0.0, "מתחיל...")
         df = quick_scan(wl, settings, progress=lambda p, t: bar.progress(min(p, 1.0), f"מנתח {t}..."))
         bar.empty()
@@ -377,7 +401,7 @@ with tab_s:
 
 
 # ───── Market trends ─────
-with tab_m:
+def render_market():
     st.markdown("### 🌎 תמונת מצב – השוק האמריקאי")
     try:
         idx = D.get_snapshot(tuple(D.INDEXES))
@@ -402,8 +426,7 @@ with tab_m:
         st.error(f"שגיאה בטעינת נתוני שוק: {e}")
 
 
-# ───── News ─────
-with tab_n:
+def render_news():
     st.markdown("### 📰 חדשות שוק כלליות + סנטימנט")
     try:
         from engine.sentiment import analyze_news
@@ -416,6 +439,20 @@ with tab_n:
                         f"לפני {it['age_h']:.0f} ש'</span>", unsafe_allow_html=True)
     except Exception as e:
         st.error(f"שגיאה בטעינת חדשות: {e}")
+
+
+def gated(tab, key, label, fn):
+    with tab:
+        if st.button(label, key=f"btn_{key}", type="primary"):
+            ss[key] = True
+        if ss.get(key):
+            fn()
+        else:
+            st.caption("הנתונים נטענים רק אחרי לחיצה")
+
+
+gated(tab_m, "show_market", "▶️ טען נתוני שוק", render_market)
+gated(tab_n, "show_news", "▶️ טען חדשות", render_news)
 
 
 # ───── Backtest ─────

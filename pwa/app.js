@@ -68,6 +68,7 @@ $("#intervalChips").addEventListener("click", e => {
 });
 $("#horizonRange").addEventListener("input", e => { S.horizon = +e.target.value; $("#horizonText").textContent = horizonText(); });
 $("#horizonRange").addEventListener("change", () => { save(); if (current) runAnalyze(current.ticker); });
+$("#backBtn").addEventListener("click", () => { clearTimeout(refreshTimer); current = null; renderPicker(); });
 $("#searchForm").addEventListener("submit", e => {
   e.preventDefault();
   const t = $("#tickerInput").value.trim().toUpperCase();
@@ -403,6 +404,30 @@ async function boot() {
     if (META.auth_required && !META.auth_ok) { location.hash = "#settings"; toast("הזן קוד גישה בהגדרות"); }
   } catch (e) { $("#sessionBadge").textContent = "אין חיבור לשרת"; }
   route();
-  if (!location.hash || location.hash === "#analyze") runAnalyze(S.ticker || "NVDA");
+  renderPicker();
 }
+
+// Start screen: choose a stock first – nothing runs until the user taps Start
+let pickGroup = null;
+function renderPicker() {
+  const groups = Object.keys(META.groups || {});
+  if (!pickGroup) pickGroup = groups[0];
+  const list = META.groups[pickGroup] || [];
+  $("#tickerInput").value = S.ticker || "";
+  $("#analysis").innerHTML = `<div class="card"><h3>1️⃣ בחר קבוצה</h3>
+    <div class="chips wrap">${groups.map(g => `<button class="chip ${g === pickGroup ? "on" : ""}" data-pg="${esc(g)}">${esc(g)}</button>`).join("")}</div>
+    <h3 style="margin-top:12px">2️⃣ בחר מניה</h3>
+    <div class="chips wrap">${list.map(t => `<button class="chip ${t === S.ticker ? "on" : ""}" data-pt="${t}">${t}</button>`).join("")}</div>
+    <p class="small muted" style="margin:10px 0 0">או הקלד סימול בתיבה למעלה, ואז לחץ <b>Start</b>.</p></div>
+    <button id="startBtn" class="btn primary block">▶️ Start${S.ticker ? " – " + esc(S.ticker) : ""}</button>`;
+}
+$("#analysis").addEventListener("click", e => {
+  const g = e.target.closest("[data-pg]"), t = e.target.closest("[data-pt]");
+  if (g) { pickGroup = g.dataset.pg; renderPicker(); }
+  if (t) { S.ticker = t.dataset.pt; save(); renderPicker(); }
+  if (e.target.closest("#startBtn")) {
+    const v = ($("#tickerInput").value || S.ticker || "").trim().toUpperCase();
+    if (v) runAnalyze(v); else toast("בחר מניה קודם");
+  }
+});
 boot();
