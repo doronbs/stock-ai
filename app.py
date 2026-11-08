@@ -12,9 +12,35 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from engine import data as D
-from engine.alerts import format_alert, load_config, save_config, send_telegram
-from engine.analyzer import Settings, analyze, day_change, quick_scan
+import importlib
+import os
+import sys
+
+
+def _refresh_engine():
+    """Streamlit keeps imported modules in memory between reruns. After the code is
+    updated on the server, reload any engine module whose file changed, in dependency
+    order, so new functions are always available without a manual reboot."""
+    order = ["engine.data", "engine.indicators", "engine.sentiment", "engine.model",
+             "engine.premarket", "engine.universe", "engine.alerts", "engine.analyzer"]
+    changed = False
+    for name in order:
+        mod = sys.modules.get(name)
+        if mod is None or not getattr(mod, "__file__", None):
+            continue
+        mtime = os.path.getmtime(mod.__file__)
+        if changed or getattr(mod, "_loaded_mtime", None) != mtime:
+            mod = importlib.reload(mod)
+            changed = True
+        mod._loaded_mtime = mtime
+
+
+_refresh_engine()
+
+from engine import data as D  # noqa: E402
+from engine.alerts import format_alert, load_config, save_config, send_telegram  # noqa: E402
+from engine.analyzer import (Settings, analyze, day_change, quick_scan, rank,  # noqa: E402
+                             scan_row)
 from engine.universe import GROUPS
 
 st.set_page_config(page_title="StockAI – ניתוח מניות", page_icon="📈", layout="wide")
@@ -396,7 +422,6 @@ with tab_s:
         table = st.empty()
         rows = []
         market = D.market_regime() if settings.use_market else None
-        from engine.analyzer import rank, scan_row
         for i, t in enumerate(wl):
             rows.append(scan_row(t, settings, market))
             nxt = f"מנתח {wl[i + 1]}... ({i + 1}/{len(wl)})" if i + 1 < len(wl) else f"הסתיים ✅ ({len(wl)}/{len(wl)})"
