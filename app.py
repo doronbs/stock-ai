@@ -4,6 +4,9 @@
 """
 from __future__ import annotations
 
+import threading
+import time
+import uuid
 from datetime import datetime
 
 import numpy as np
@@ -390,6 +393,66 @@ with tab_a:
 
 
 # ───── Scanner ─────
+@st.cache_resource
+def scan_store():
+    """Process-wide store: scans keep running on the server even when the phone app is
+    in the background or closed, and results are there when you come back."""
+    return {"jobs": {}, "last": None, "lock": threading.Lock()}
+
+
+def start_scan_job(store, tickers, s):
+    jid = uuid.uuid4().hex[:8]
+    job = {"status": "running", "rows": [], "n": len(tickers), "done": 0, "current": tickers[0],
+           "started": time.time(), "finished": None, "cancel": False, "tickers": list(tickers)}
+    with store["lock"]:
+        for k in [k for k, v in store["jobs"].items() if time.time() - v["started"] > 6 * 3600]:
+            store["jobs"].pop(k, None)
+        store["jobs"][jid] = job
+        store["last"] = jid
+
+    def run():
+        try:
+            market = D.market_regime() if s.use_market else None
+            for i, t in enumerate(tickers):
+                if job["cancel"]:
+                    job["status"] = "cancelled"
+                    break
+                job["current"] = t
+                job["rows"].append(scan_row(t, s, market))
+                job["done"] = i + 1
+            else:
+                job["status"] = "done"
+        except Exception as e:  # pragma: no cover
+            job["status"], job["error"] = "error", str(e)
+        job["finished"] = time.time()
+
+    threading.Thread(target=run, daemon=True).start()
+    return jid
+
+
+def render_scan_job(job, style_scan):
+    n, done = job["n"], job["done"]
+    started = datetime.fromtimestamp(job["started"]).strftime("%H:%M")
+    if job["status"] == "running":
+        st.progress(done / n if n else 1.0,
+                    f"🔄 רץ ברקע (התחיל {started}) – מנתח {job['current']}... ({done}/{n}). "
+                    f"אפשר לעבור לאפליקציה אחרת ולחזור.")
+        if st.button("⏹ עצור סריקה", key="cancel_scan"):
+            job["cancel"] = True
+    elif job["status"] == "done":
+        fin = datetime.fromtimestamp(job["finished"]).strftime("%H:%M")
+        st.success(f"✅ הסריקה הסתיימה ב-{fin} ({n} מניות)")
+    elif job["status"] == "cancelled":
+        st.warning(f"הסריקה נעצרה ({done}/{n})")
+    else:
+        st.error(f"שגיאה בסריקה: {job.get('error')}")
+    if job["rows"]:
+        df = rank(list(job["rows"]))
+        ss["scan"] = df
+        st.dataframe(style_scan(df), use_container_width=True, hide_index=True, height=560)
+        st.caption("ממוין לפי חוזק האיתות. שורה ירוקה = 60%+ לעלייה. AUC מעל 0.55 = למודל יתרון מוכח.")
+
+
 with tab_s:
     st.markdown("### 🔎 סורק – מדרג את המניות לפי חוזק האיתות")
     wl_text = st.text_area("רשימת מעקב (מופרדות בפסיק)", ", ".join(cfg["watchlist"]), height=80)
@@ -422,22 +485,29 @@ with tab_s:
             return ""
         return df.style.apply(row_color, axis=1).map(sell_cell, subset=["סיכוי עלייה %"])
 
+    store = scan_store()
     if run_scan and wl:
-        # Progressive display: each stock appears (re-ranked) as soon as it's analysed
-        bar = st.progress(0.0, f"מנתח {wl[0]}... (0/{len(wl)})")
-        table = st.empty()
-        rows = []
-        market = D.market_regime() if settings.use_market else None
-        for i, t in enumerate(wl):
-            rows.append(scan_row(t, settings, market))
-            nxt = f"מנתח {wl[i + 1]}... ({i + 1}/{len(wl)})" if i + 1 < len(wl) else f"הסתיים ✅ ({len(wl)}/{len(wl)})"
-            bar.progress((i + 1) / len(wl), nxt)
-            table.dataframe(style_scan(rank(rows)), use_container_width=True, hide_index=True, height=560)
-        ss["scan"] = rank(rows)
-        st.caption("ממוין לפי חוזק האיתות (מרחק מ-50%). שים לב לעמודת AUC – מעל 0.55 = למודל יש יתרון מוכח במניה זו.")
+        jid = start_scan_job(store, wl, settings)
+        ss["scan_job"] = jid
+        try:
+            st.query_params["scan"] = jid
+        except Exception:
+            pass
+    # Find the job: this session → URL → most recent job on the server (survives app switch/close)
+    jid = ss.get("scan_job") or st.query_params.get("scan") or store.get("last")
+    job = store["jobs"].get(jid) if jid else None
+    if job:
+        ss["scan_job"] = jid
+        if job["status"] == "running":
+            def live():
+                render_scan_job(job, style_scan)
+                if job["status"] != "running":
+                    st.rerun()  # finished → redraw once without the 2-second timer
+            st.fragment(run_every=2)(live)()
+        else:
+            render_scan_job(job, style_scan)
     elif "scan" in ss:
         st.dataframe(style_scan(ss["scan"]), use_container_width=True, hide_index=True, height=560)
-        st.caption("תוצאות הסריקה האחרונה. ממוין לפי חוזק האיתות (מרחק מ-50%).")
 
 
 # ───── Market trends ─────

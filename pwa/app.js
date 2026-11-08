@@ -41,6 +41,7 @@ function route() {
   const v = VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : "analyze";
   VIEWS.forEach(n => $(`#v-${n}`).classList.toggle("hidden", n !== v));
   document.querySelectorAll(".tabs a").forEach(a => a.classList.toggle("on", a.dataset.v === v));
+  if (v === "scan" && S.scanJob && !polling) pollScan(S.scanJob);
   if (v === "market") loadMarket();
   if (v === "news") loadNews();
   if (v === "settings") fillSettings();
@@ -302,20 +303,40 @@ $("#groupChips").addEventListener("click", e => {
 $("#scanBtn").addEventListener("click", async () => {
   const list = $("#scanList").value; S.scanList = list; save();
   if (!list.trim()) return toast("בחר קבוצה או הזן מניות");
-  $("#scanBtn").disabled = true; $("#scanProgress").classList.remove("hidden"); $("#scanResults").innerHTML = ""; scanRows = [];
+  $("#scanResults").innerHTML = ""; scanRows = [];
   try {
     const {job} = await api("scan", {tickers: list, ...baseParams()});
+    S.scanJob = job; save();
+    pollScan(job);
+  } catch (e) { $("#scanResults").innerHTML = `<div class="err">⚠️ ${esc(e.message)}</div>`; }
+});
+
+// The scan runs on the server; the app can go to the background or be closed and
+// will pick the same job up again when reopened.
+let polling = null;
+async function pollScan(job) {
+  if (polling === job) return;
+  polling = job;
+  $("#scanBtn").disabled = true; $("#scanProgress").classList.remove("hidden");
+  try {
     for (;;) {
-      await new Promise(res => setTimeout(res, 1000));
       const st = await api("scan/status", {job});
       $("#scanBar").style.width = (st.progress * 100).toFixed(0) + "%";
-      $("#scanText").textContent = st.status === "running" ? `מנתח ${st.current}… (${st.done || 0}/${st.n}) – התוצאות מתעדכנות תוך כדי` : "";
-      if ((st.rows || []).length !== scanRows.length || st.status === "done") { scanRows = st.rows || []; renderScan(); }
-      if (st.status === "done") break;
-      if (st.status === "error") throw new Error(st.error);
+      $("#scanText").textContent = st.status === "running"
+        ? `🔄 רץ ברקע – מנתח ${st.current}… (${st.done || 0}/${st.n}). אפשר לעבור לאפליקציה אחרת.` : "";
+      if ((st.rows || []).length !== scanRows.length || st.status !== "running") { scanRows = st.rows || []; renderScan(); }
+      if (st.status !== "running") break;
+      await new Promise(res => setTimeout(res, 1000));
     }
-  } catch (e) { $("#scanResults").innerHTML = `<div class="err">⚠️ ${esc(e.message)}</div>`; }
+  } catch (e) {
+    if (/לא נמצאה/.test(e.message)) { S.scanJob = null; save(); }
+    else $("#scanResults").insertAdjacentHTML("afterbegin", `<div class="err">⚠️ ${esc(e.message)}</div>`);
+  }
+  polling = null;
   $("#scanBtn").disabled = false; $("#scanProgress").classList.add("hidden");
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && S.scanJob && !polling) pollScan(S.scanJob);
 });
 $("#scanFilter").addEventListener("click", e => {
   const b = e.target.closest("[data-f]"); if (!b) return; scanFilter = b.dataset.f; renderScan();

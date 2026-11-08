@@ -226,7 +226,7 @@ async def api_scan_start(req: Request):
                      "started": time.time()}
     threading.Thread(target=_run_scan, args=(job_id, tickers, s), daemon=True).start()
     # forget old jobs
-    for k in [k for k, v in _jobs.items() if time.time() - v["started"] > 3600]:
+    for k in [k for k, v in _jobs.items() if time.time() - v["started"] > 6 * 3600]:
         _jobs.pop(k, None)
     return ok({"job": job_id})
 
