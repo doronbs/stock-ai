@@ -50,6 +50,13 @@ from engine.analyzer import (Settings, analyze, day_change, quick_scan, rank,  #
                              scan_row)
 from engine.universe import GROUPS
 
+IL = ZoneInfo("Asia/Jerusalem")
+
+
+def il_time(ts: float, fmt: str = "%H:%M") -> str:
+    """Server runs in UTC – always show Israel time."""
+    return datetime.fromtimestamp(ts, IL).strftime(fmt)
+
 st.set_page_config(page_title="StockAI – ניתוח מניות", page_icon="📈", layout="wide")
 
 st.markdown("""
@@ -449,13 +456,7 @@ with tab_a:
 
 
 # ───── Scanner ─────
-IL = ZoneInfo("Asia/Jerusalem")
 SCAN_DIR = Path(__file__).resolve().parent / "user_data"
-
-
-def il_time(ts: float, fmt: str = "%H:%M") -> str:
-    """Server runs in UTC – always show Israel time."""
-    return datetime.fromtimestamp(ts, IL).strftime(fmt)
 
 
 def _scan_file(owner: str) -> Path:
