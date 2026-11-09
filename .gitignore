@@ -3,3 +3,4 @@ settings.json
 __pycache__/
 *.pyc
 settings_*.json
+user_data/

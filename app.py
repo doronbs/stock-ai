@@ -8,7 +8,10 @@ import re
 import threading
 import time
 import uuid
+import json
 from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -274,8 +277,9 @@ elif ss.get("_user_tip") is None:
     ss["_user_tip"] = True
     st.toast(f"מחובר כ-{USER}. כדי שהאייקון במסך הבית יזכור אותך, הוסף אותו מחדש מהדף הזה.", icon="👤")
 
-tab_a, tab_s, tab_m, tab_n, tab_b, tab_h = st.tabs(
-    ["📈 ניתוח מניה", "🔎 סורק מניות", "🌎 מגמות שוק", "📰 חדשות", "🧪 בדיקה היסטורית", "❓ איך זה עובד"])
+# Scanner first: the app opens on the last scan
+tab_s, tab_a, tab_m, tab_n, tab_b, tab_h = st.tabs(
+    ["🔎 סורק מניות", "📈 ניתוח מניה", "🌎 מגמות שוק", "📰 חדשות", "🧪 בדיקה היסטורית", "❓ איך זה עובד"])
 
 
 def render_analysis():
@@ -301,7 +305,7 @@ def render_analysis():
 
     name = r.info.get("shortName") or ticker
     st.subheader(f"{name} ({ticker})")
-    st.caption(f"עודכן: {datetime.now():%H:%M:%S} | נר אחרון: {r.frame.index[-1]} | "
+    st.caption(f"עודכן: {il_time(time.time(), '%H:%M:%S')} | נר אחרון: {r.frame.index[-1]} | "
                f"תחזית ל-{horizon_text(interval, horizon)} קדימה"
                + (f" | רענון כל {refresh} דק'" if refresh else ""))
 
@@ -445,6 +449,45 @@ with tab_a:
 
 
 # ───── Scanner ─────
+IL = ZoneInfo("Asia/Jerusalem")
+SCAN_DIR = Path(__file__).resolve().parent / "user_data"
+
+
+def il_time(ts: float, fmt: str = "%H:%M") -> str:
+    """Server runs in UTC – always show Israel time."""
+    return datetime.fromtimestamp(ts, IL).strftime(fmt)
+
+
+def _scan_file(owner: str) -> Path:
+    return SCAN_DIR / f"last_scan_{owner}.json"
+
+
+def save_last_scan(job) -> None:
+    """Keep each named user's last scan on disk, so it is shown when the app is reopened."""
+    owner = job.get("owner") or ""
+    if not owner or owner.startswith("guest-") or not job["rows"]:
+        return
+    try:
+        SCAN_DIR.mkdir(exist_ok=True)
+        data = {k: job[k] for k in ("n", "done", "started", "finished", "tickers", "owner")}
+        data["rows"] = rank(list(job["rows"])).astype(object).where(lambda d: d.notna(), None).to_dict("records")
+        tmp = _scan_file(owner).with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(_scan_file(owner))
+    except Exception:
+        pass
+
+
+def load_last_scan(owner: str):
+    try:
+        data = json.loads(_scan_file(owner).read_text(encoding="utf-8"))
+        data.update(status="saved", cancel=False, current="")
+        data["finished"] = data.get("finished") or data["started"]
+        return data
+    except Exception:
+        return None
+
+
 @st.cache_resource
 def scan_store():
     """Process-wide store: scans keep running on the server even when the phone app is
@@ -473,11 +516,15 @@ def start_scan_job(store, tickers, s, owner):
                 job["current"] = t
                 job["rows"].append(scan_row(t, s, market))
                 job["done"] = i + 1
+                if job["done"] % 5 == 0:
+                    job["finished"] = time.time()
+                    save_last_scan(job)
             else:
                 job["status"] = "done"
         except Exception as e:  # pragma: no cover
             job["status"], job["error"] = "error", str(e)
         job["finished"] = time.time()
+        save_last_scan(job)
 
     threading.Thread(target=run, daemon=True).start()
     return jid
@@ -485,7 +532,7 @@ def start_scan_job(store, tickers, s, owner):
 
 def render_scan_job(job, style_scan):
     n, done = job["n"], job["done"]
-    started = datetime.fromtimestamp(job["started"]).strftime("%H:%M")
+    started = il_time(job["started"])
     if job["status"] == "running":
         st.progress(done / n if n else 1.0,
                     f"🔄 רץ ברקע (התחיל {started}) – מנתח {job['current']}... ({done}/{n}). "
@@ -493,8 +540,10 @@ def render_scan_job(job, style_scan):
         if st.button("⏹ עצור סריקה", key="cancel_scan"):
             job["cancel"] = True
     elif job["status"] == "done":
-        fin = datetime.fromtimestamp(job["finished"]).strftime("%H:%M")
-        st.success(f"✅ הסריקה הסתיימה ב-{fin} ({n} מניות)")
+        st.success(f"✅ הסריקה הסתיימה ב-{il_time(job['finished'])} ({n} מניות)")
+    elif job["status"] == "saved":
+        st.info(f"🕘 הסריקה האחרונה שלך: {il_time(job['finished'], '%d/%m %H:%M')} "
+                f"({len(job['rows'])} מניות) – לחץ ▶️ הרץ סריקה לרענון")
     elif job["status"] == "cancelled":
         st.warning(f"הסריקה נעצרה ({done}/{n})")
     else:
@@ -554,8 +603,11 @@ with tab_s:
     job = store["jobs"].get(jid) if jid else None
     if job and job.get("owner") != OWNER:      # never show someone else's scan
         job = None
+    if job is None and not run_scan:           # reopened app / server restarted → last saved scan
+        job = load_last_scan(OWNER)
     if job:
-        ss["scan_job"] = jid
+        if jid in store["jobs"]:
+            ss["scan_job"] = jid
         if job["status"] == "running":
             def live():
                 render_scan_job(job, style_scan)
