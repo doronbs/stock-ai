@@ -201,17 +201,40 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
         market = D.market_regime()
     mtf = higher_timeframe(ticker, s.interval) if s.use_mtf else None
 
-    z = _logit(model["p_up"])
-    br = {"מודל ML (מכויל)": model["p_up"]}
+    pm = None
+    if s.use_premarket and intraday:
+        try:
+            pm = premarket_analysis(ticker, session)
+        except Exception:
+            pm = None
+
+    # ── Extended hours: the ML model and the technical layers only know the last REGULAR
+    # bar (yesterday's close). When the stock has already gapped in pre-market (e.g. on
+    # news) their view is stale, and the question that matters is "will it rise from the
+    # CURRENT pre-market price?". We blend toward the stock's own history of similar gaps
+    # (how often it closed above the open after such a gap) in proportion to gap size.
+    stale = 0.0
+    p_model = model["p_up"]
+    z = _logit(p_model)
+    br = {"מודל ML (מכויל)": p_model}
+    if pm and session == "premarket" and abs(pm.get("gap_%", 0)) >= 0.5:
+        stale = float(np.clip(abs(pm["gap_%"]) / 2.0, 0.3, 0.85))
+        if pm.get("p_gap") is not None:
+            z_new = (1 - stale) * z + stale * _logit(pm["p_gap"])
+        else:                      # no history of similar gaps → model view simply fades
+            z_new = (1 - stale) * z
+        br[f"התאמה למחיר המוקדם (פער {pm['gap_%']:+.1f}%)"] = z_new - z
+        z = z_new
+
     # Technical/MTF layers overlap the model's own features; trust them in
-    # proportion to the edge the model actually proved out-of-sample.
-    trust = 0.3 + 0.7 * model["skill"]
+    # proportion to the edge the model actually proved out-of-sample (and less when stale).
+    trust = (0.3 + 0.7 * model["skill"]) * (1 - stale)
     adj = s.w_tech * tech * trust
     br["ניתוח טכני"] = adj
     if news and news["items"]:
-        # dampen if only a few headlines
+        # dampen if only a few headlines; news drives pre-market moves → more weight there
         conf = min(1.0, len(news["items"]) / 10)
-        n_adj = s.w_news * news["score"] * conf * 2
+        n_adj = s.w_news * news["score"] * conf * 2 * (1.5 if session == "premarket" else 1.0)
         adj += n_adj
         br["סנטימנט חדשות"] = n_adj
     if market and s.use_market:
@@ -222,17 +245,14 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
         t_adj = s.w_mtf * mtf["score"] * trust
         adj += t_adj
         br["טווח זמן גבוה"] = t_adj
-    pm = None
-    if s.use_premarket and intraday:
-        try:
-            pm = premarket_analysis(ticker, session)
-        except Exception:
-            pm = None
-    if pm and pm["active"] and pm["signal"]:
-        pm_adj = s.w_pm * pm["signal"]
-        adj += pm_adj
-        br["מסחר מוקדם / פער"] = pm_adj
-    pat_adj = 0.08 * sum(d for _, d in patterns)
+    if pm and pm["active"]:
+        # gap-history part is already in the blend above during pre-market
+        sig = pm["sig_flow"] if stale else pm["signal"]
+        if sig:
+            pm_adj = s.w_pm * sig
+            adj += pm_adj
+            br["מסחר מוקדם – נפח/VWAP"] = pm_adj
+    pat_adj = 0.08 * sum(d for _, d in patterns) * (1 - stale)
     adj += pat_adj
     if pat_adj:
         br["תבניות נרות"] = pat_adj

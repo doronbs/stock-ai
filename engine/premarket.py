@@ -134,9 +134,14 @@ def premarket_analysis(ticker: str, session: str | None = None) -> dict:
         conf = st["n"] / (st["n"] + 20)
         cont_edge = (st["continuation"] - 0.5) * 2          # >0: gaps tend to run, <0: tend to fade
         sig += direction * cont_edge * conf
+        # P(stock closes the day ABOVE the open after a similar gap) – i.e. "will it rise
+        # from the current pre-market price", shrunk toward 50% when there are few cases.
+        p_up_from_open = st["continuation"] if gap > 0 else 1 - st["continuation"]
+        out["p_gap"] = 0.5 + (p_up_from_open - 0.5) * conf
         notes.append(f"{st['n']} פערים דומים בעבר: המשכיות {st['continuation'] * 100:.0f}%, "
                      f"סגירת פער {st['fill_rate'] * 100:.0f}%, ממוצע פתיחה→סגירה "
                      f"{st['avg_open_to_close_%']:+.2f}%")
+    sig_cont = sig
     rv = out.get("pm_rel_volume")
     if session == "premarket" and rv:
         if rv > 2 and abs(gap) > 0.01:
@@ -155,6 +160,7 @@ def premarket_analysis(ticker: str, session: str | None = None) -> dict:
         elif last_price < out["pm_low"]:
             sig -= 0.3; notes.append("שבירה מתחת לשפל המסחר המוקדם")
     out["signal"] = float(np.clip(sig, -1, 1))
+    out["sig_flow"] = float(np.clip(sig - sig_cont, -1, 1))   # volume / VWAP / PM-range part only
     out["notes"] = notes
     out["active"] = bool(relevant)
     return out
