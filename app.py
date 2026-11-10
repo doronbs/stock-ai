@@ -8,6 +8,7 @@ import re
 import threading
 import time
 import uuid
+import dataclasses
 import json
 from datetime import datetime
 from pathlib import Path
@@ -477,7 +478,8 @@ def save_last_scan(job) -> None:
         return
     try:
         SCAN_DIR.mkdir(exist_ok=True)
-        data = {k: job[k] for k in ("n", "done", "started", "finished", "tickers", "owner")}
+        data = {k: job.get(k) for k in ("n", "done", "started", "finished", "tickers", "owner",
+                                        "as_of", "horizon")}
         data["rows"] = rank(list(job["rows"])).astype(object).where(lambda d: d.notna(), None).to_dict("records")
         tmp = _scan_file(owner).with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -507,7 +509,9 @@ def start_scan_job(store, tickers, s, owner):
     jid = uuid.uuid4().hex[:8]
     job = {"status": "running", "rows": [], "n": len(tickers), "done": 0, "current": tickers[0],
            "started": time.time(), "finished": None, "cancel": False, "tickers": list(tickers),
-           "owner": owner}
+           "owner": owner,
+           "as_of": s.as_of.strftime("%d/%m/%Y %H:%M") if s.as_of is not None else None,
+           "horizon": horizon_text(s.interval, s.horizon)}
     with store["lock"]:
         for k in [k for k, v in store["jobs"].items() if time.time() - v["started"] > 6 * 3600]:
             store["jobs"].pop(k, None)
@@ -556,6 +560,22 @@ def render_scan_job(job, style_scan):
         st.warning(f"הסריקה נעצרה ({done}/{n})")
     else:
         st.error(f"שגיאה בסריקה: {job.get('error')}")
+    if job.get("as_of"):
+        st.markdown(f"#### 📅 דוח היסטורי – {job['as_of']} (שעון ניו יורק)")
+        st.caption(f"התחזיות חושבו רק מנתונים שהיו ידועים אז. 'שינוי בפועל' = מה קרה "
+                   f"{job.get('horizon', '')} אחרי הדוח.")
+        rows_ = [r for r in job["rows"] if r.get("צדקה?")]
+        sig = [r for r in rows_ if str(r["צדקה?"]).startswith(("✅", "❌"))]
+        hit = sum(str(r["צדקה?"]).startswith("✅") for r in sig)
+        dirs = [r for r in rows_ if r.get("כיוון נכון") in ("✅", "❌")]
+        dhit = sum(r["כיוון נכון"] == "✅" for r in dirs)
+        m1, m2 = st.columns(2)
+        m1.metric("המלצות קנייה/מכירה שצדקו", f"{hit}/{len(sig)}",
+                  f"{hit / len(sig) * 100:.0f}%" if sig else None)
+        m2.metric("כיוון נכון (כל המניות)", f"{dhit}/{len(dirs)}",
+                  f"{dhit / len(dirs) * 100:.0f}%" if dirs else None)
+        if len(sig) < 10:
+            st.caption("⚠️ מעט מדי איתותים כדי להסיק מסקנה – הרץ על כמה ימים שונים או רשימה גדולה יותר.")
     if job["rows"]:
         df = rank(list(job["rows"]))
         ss["scan"] = df
@@ -582,6 +602,31 @@ with tab_s:
     if preset != "—":
         wl = presets[preset]
         st.caption("ייסרקו: " + ", ".join(wl) + " — לחץ ▶️ הרץ סריקה")
+
+    # ── Historical report: run the scan "as of" a past moment, then check what really happened
+    scan_settings = settings
+    with st.expander("📅 דוח ליום בעבר – לבדוק אם המערכת צדקה"):
+        past_on = st.checkbox("הרץ את הסריקה כאילו אנחנו ביום ובשעה שבחרתי", key="past_on")
+        max_days = {"1m": 6, "2m": 58, "5m": 58, "15m": 58, "30m": 58, "60m": 700,
+                    "1d": 1800, "1wk": 3600}.get(interval, 58)
+        today_ny = datetime.now(ZoneInfo("America/New_York")).date()
+        pc1, pc2 = st.columns(2)
+        past_date = pc1.date_input("תאריך", value=today_ny - pd.Timedelta(days=1),
+                                   min_value=today_ny - pd.Timedelta(days=max_days),
+                                   max_value=today_ny, key="past_date")
+        times = [f"{h:02d}:{m:02d}" for h in range(9, 16) for m in (0, 15, 30, 45)
+                 if (h, m) >= (9, 45)] + ["15:55"]
+        past_time = pc2.selectbox("שעה (ניו יורק)", times, index=len(times) - 1, key="past_time",
+                                  format_func=lambda t: f"{t} (סוף יום)" if t == "15:55" else t)
+        as_of = pd.Timestamp(f"{past_date} {past_time}", tz="America/New_York")
+        st.caption(f"= {as_of.tz_convert(IL):%d/%m %H:%M} שעון ישראל · "
+                   f"המערכת משתמשת רק בנתונים שהיו ידועים עד הרגע הזה, ואז בודקת מה קרה "
+                   f"{horizon_text(interval, horizon)} אחר כך. "
+                   f"באינטרוול {interval} אפשר לחזור עד {max_days} ימים אחורה. "
+                   f"חדשות ומסחר מוקדם לא נכללים בדוח היסטורי.")
+        if past_on:
+            scan_settings = dataclasses.replace(settings, as_of=as_of)
+            st.info(f"📅 מצב דוח היסטורי פעיל – {as_of:%d/%m/%Y %H:%M} ניו יורק. לחץ ▶️ הרץ סריקה.")
     def style_scan(df):
         """Whole row green when P(up) >= 60%; probability cell red at/below the sell threshold."""
         if "סיכוי עלייה %" not in df:
@@ -602,14 +647,23 @@ with tab_s:
             if isinstance(v, (int, float)) and not pd.isna(v) and v > 0.58:
                 return "background-color: #16a34a; color: white; font-weight: 700"
             return ""
+        def verdict_cell(v):
+            v = str(v or "")
+            if v.startswith("✅"):
+                return "background-color: rgba(34,197,94,.45); font-weight: 700"
+            if v.startswith("❌"):
+                return "background-color: rgba(224,87,59,.45); font-weight: 700"
+            return ""
         sty = df.style.apply(row_color, axis=1).map(sell_cell, subset=["סיכוי עלייה %"])
+        if "צדקה?" in df:
+            sty = sty.map(verdict_cell, subset=["צדקה?"])
         if "AUC מודל" in df:
             sty = sty.map(auc_cell, subset=["AUC מודל"])
         return sty
 
     store = scan_store()
     if run_scan and wl:
-        jid = start_scan_job(store, wl, settings, OWNER)
+        jid = start_scan_job(store, wl, scan_settings, OWNER)
         ss["scan_job"] = jid
         try:
             st.query_params["scan"] = jid

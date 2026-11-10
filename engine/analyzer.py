@@ -29,6 +29,7 @@ class Settings:
     w_tech: float = 0.25
     w_mtf: float = 0.20
     w_pm: float = 0.50
+    as_of: pd.Timestamp | None = None   # run the report "as of" a past moment (NY time)
 
 
 @dataclass
@@ -52,6 +53,7 @@ class Result:
     session: str = "regular"
     premarket: dict | None = None
     last_close: float = 0.0
+    evaluation: dict | None = None
 
 
 def _logit(p):
@@ -129,10 +131,10 @@ def technical_votes(x: pd.DataFrame) -> tuple[float, list]:
     return score, reasons
 
 
-def higher_timeframe(ticker: str, interval: str) -> dict | None:
+def higher_timeframe(ticker: str, interval: str, as_of=None) -> dict | None:
     hi = "1d" if interval in D.INTRADAY else "1wk"
     try:
-        h = I.add_all(D.get_history(ticker, hi), intraday=False)
+        h = I.add_all(D.truncate(D.get_history(ticker, hi), as_of, daily=True), intraday=False)
     except Exception:
         return None
     r = h.iloc[-1]
@@ -181,28 +183,36 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
     intraday = s.interval in D.INTRADAY
     # The model always trains on regular-session bars (cleaner, liquid data);
     # extended hours are handled by the dedicated pre-market layer below.
-    raw = D.get_history(ticker, s.interval, prepost=False)
+    raw_full = D.get_history(ticker, s.interval, prepost=False)
+    past = s.as_of is not None
+    if past:
+        # Historical report: the system sees ONLY bars that existed at that moment.
+        raw = D.truncate(raw_full, s.as_of, daily=not intraday)
+        if len(raw) < 300:
+            raise ValueError("אין מספיק נתונים לפני התאריך הזה לאינטרוול שנבחר")
+    else:
+        raw = raw_full
     x = I.add_all(raw, intraday)
-    session = market_session()
+    session = "regular" if past else market_session()
 
     model = train_and_predict(x, intraday, s.horizon, s.buy_th, s.sell_th)
     tech, reasons = technical_votes(x)
     supports, resistances = I.support_resistance(x)
     patterns = I.candle_patterns(x)
-    info = D.get_info(ticker) if with_info else {}
+    info = D.get_info(ticker) if (with_info and not past) else {}
 
     news = None
-    if s.use_news:
+    if s.use_news and not past:   # past headlines can't be reconstructed reliably → off
         try:
             news = analyze_news(D.get_news(ticker, info.get("shortName")))
         except Exception:
             news = None
     if s.use_market and market is None:
-        market = D.market_regime()
-    mtf = higher_timeframe(ticker, s.interval) if s.use_mtf else None
+        market = D.market_regime(s.as_of)
+    mtf = higher_timeframe(ticker, s.interval, s.as_of) if s.use_mtf else None
 
     pm = None
-    if s.use_premarket and intraday:
+    if s.use_premarket and intraday and not past:
         try:
             pm = premarket_analysis(ticker, session)
         except Exception:
@@ -274,7 +284,26 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
     if pm and session in ("premarket", "afterhours", "closed"):
         price = pm["last_price"]          # live extended-hours price
     levels = trade_levels(x, 1 if p >= 0.5 else -1, supports, resistances, price)
+    evaluation = None
+    if past:
+        future = raw_full[len(raw):]
+        evaluation = {"entry": last_close, "known": len(future) >= s.horizon}
+        if evaluation["known"]:
+            exit_price = float(future["Close"].iloc[s.horizon - 1])
+            ret = (exit_price / last_close - 1) * 100
+            went_up = exit_price > last_close
+            if lvl in ("buy", "strong_buy"):
+                verdict = "✅ צדקה" if went_up else "❌ טעתה"
+            elif lvl in ("sell", "strong_sell"):
+                verdict = "✅ צדקה" if not went_up else "❌ טעתה"
+            else:
+                verdict = "⚪ ללא המלצה"
+            # direction call for every stock (even neutral ones): p>=50% means "up"
+            evaluation.update(exit=exit_price, ret=ret, went_up=went_up, verdict=verdict,
+                              direction_ok=(p >= 0.5) == went_up,
+                              exit_time=str(future.index[s.horizon - 1]))
     return Result(ticker=ticker, price=price, last_close=last_close, session=session,
+                  evaluation=evaluation,
                   premarket=pm, p_up=p, action=action,
                   action_level=lvl, model=model, tech_score=tech, tech_reasons=reasons,
                   news=news, market=market, mtf=mtf, levels=levels, patterns=patterns,
@@ -291,6 +320,17 @@ def day_change(x: pd.DataFrame) -> float:
         if len(prev):
             return float((c.iloc[-1] / prev.iloc[-1] - 1) * 100)
     return float((c.iloc[-1] / c.iloc[-2] - 1) * 100)
+
+
+def eval_columns(r) -> dict:
+    """Extra columns for a historical report: what really happened next."""
+    e = r.evaluation
+    if e is None:
+        return {}
+    if not e["known"]:
+        return {"מחיר אחרי": None, "שינוי בפועל %": None, "צדקה?": "⏳ עוד לא ידוע", "כיוון נכון": None}
+    return {"מחיר אחרי": round(e["exit"], 2), "שינוי בפועל %": round(e["ret"], 2),
+            "צדקה?": e["verdict"], "כיוון נכון": "✅" if e["direction_ok"] else "❌"}
 
 
 def scan_row(t: str, s: Settings, market: dict | None) -> dict:
@@ -310,6 +350,7 @@ def scan_row(t: str, s: Settings, market: dict | None) -> dict:
             "RSI": round(float(x["rsi"].iloc[-1]), 1),
             "נפח יחסי": round(float(x["vol_ratio"].iloc[-1]), 2),
             "סטופ": round(r.levels["stop"], 2), "יעד": round(r.levels["target"], 2),
+            **eval_columns(r),
         }
     except Exception as e:
         return {"מניה": t.upper(), "המלצה": f"שגיאה: {str(e)[:60]}"}
@@ -317,7 +358,7 @@ def scan_row(t: str, s: Settings, market: dict | None) -> dict:
 
 def scan_iter(tickers: list[str], s: Settings):
     """Yield (index, row) as soon as each ticker is done – for live/progressive display."""
-    market = D.market_regime() if s.use_market else None
+    market = D.market_regime(s.as_of) if s.use_market else None
     for i, t in enumerate(tickers):
         yield i, scan_row(t, s, market)
 

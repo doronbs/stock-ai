@@ -198,11 +198,27 @@ def get_snapshot(tickers: tuple[str, ...]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def market_regime() -> dict:
+def truncate(df: pd.DataFrame, as_of: pd.Timestamp | None, daily: bool) -> pd.DataFrame:
+    """Keep only bars that were already known at `as_of` (New-York time) – no look-ahead.
+    A daily bar is known only after the 16:00 close of its day."""
+    if as_of is None or df is None or df.empty:
+        return df
+    if daily:
+        d = df.index.tz_convert("America/New_York").date if df.index.tz is not None else df.index.date
+        last_known = as_of.date() if as_of.hour >= 16 else (as_of - pd.Timedelta(days=1)).date()
+        return df[d <= last_known]
+    idx = df.index if df.index.tz is not None else df.index.tz_localize("America/New_York")
+    # an intraday bar stamped 15:50 (5m) closes at 15:55 → known once its end time has passed
+    step = (idx[1] - idx[0]) if len(idx) > 1 else pd.Timedelta(minutes=5)
+    step = min(step, pd.Timedelta(hours=1))
+    return df[idx + step <= as_of]
+
+
+def market_regime(as_of: pd.Timestamp | None = None) -> dict:
     """Overall US market state – used to tilt individual-stock probabilities."""
     out = {"score": 0.0, "notes": []}
     try:
-        spy = get_history("SPY", "1d", "1y")
+        spy = truncate(get_history("SPY", "1d", "2y"), as_of, daily=True)
         c = spy["Close"]
         e50, e200 = c.ewm(span=50).mean().iloc[-1], c.ewm(span=200).mean().iloc[-1]
         s = 0.0
@@ -219,7 +235,7 @@ def market_regime() -> dict:
     except Exception as e:
         out["notes"].append(f"לא ניתן לטעון SPY: {e}")
     try:
-        vix = get_history("^VIX", "1d", "3mo")["Close"]
+        vix = truncate(get_history("^VIX", "1d", "2y"), as_of, daily=True)["Close"]
         v = float(vix.iloc[-1])
         out["vix"] = v
         if v > 28:
