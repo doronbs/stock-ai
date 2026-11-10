@@ -131,6 +131,8 @@ with st.sidebar:
     st.caption(f"התחזית: האם המחיר יהיה גבוה יותר בעוד **{horizon_text(interval, horizon)}**")
     c1, c2 = st.columns(2)
     buy_th = c1.number_input("סף קנייה", 0.5, 0.95, float(cfg["buy_th"]), 0.01)
+    min_auc = st.slider("המלצה רק כשה-AUC של המניה לפחות", 0.50, 0.60, float(cfg.get("min_auc", 0.53)), 0.01,
+                        help="מסנן איתותים ממודל שלא הוכיח יתרון על המניה. גבוה יותר = פחות איתותים, מדויקים יותר.")
     sell_th = c2.number_input("סף מכירה", 0.05, 0.5, float(cfg["sell_th"]), 0.01)
     refresh = st.select_slider("רענון אוטומטי (דקות)", [0, 1, 2, 3, 5, 10, 15, 30, 60],
                                value=int(cfg["refresh_minutes"]),
@@ -152,7 +154,7 @@ with st.sidebar:
             else:
                 st.error("השליחה נכשלה – בדוק token / chat id")
     if st.button("💾 שמור הגדרות כברירת מחדל"):
-        cfg.update(interval=interval, horizon=horizon, buy_th=buy_th, sell_th=sell_th,
+        cfg.update(interval=interval, horizon=horizon, buy_th=buy_th, sell_th=sell_th, min_auc=min_auc,
                    refresh_minutes=refresh, telegram_token=tg_tok, telegram_chat_id=tg_chat,
                    alert_min_prob=alert_p)
         if USER:
@@ -167,7 +169,7 @@ with st.sidebar:
     st.caption("מסחר מוקדם 11:00–16:30 · רגיל 16:30–23:00 · מאוחר 23:00–03:00 (שעון ישראל, משתנה בשבועות מעבר השעון)")
     st.caption("⚠️ כלי עזר לניתוח בלבד – לא ייעוץ השקעות. הסתברות היא הערכה סטטיסטית ולא ודאות.")
 
-settings = Settings(interval=interval, horizon=horizon, buy_th=buy_th, sell_th=sell_th,
+settings = Settings(interval=interval, horizon=horizon, buy_th=buy_th, sell_th=sell_th, min_auc=min_auc,
                     use_news=use_news, use_market=use_market, use_mtf=use_mtf, prepost=prepost,
                     use_premarket=use_pm)
 tg_cfg = {"telegram_token": tg_tok, "telegram_chat_id": tg_chat}
@@ -479,7 +481,7 @@ def save_last_scan(job) -> None:
     try:
         SCAN_DIR.mkdir(exist_ok=True)
         data = {k: job.get(k) for k in ("n", "done", "started", "finished", "tickers", "owner",
-                                        "as_of", "horizon")}
+                                        "as_of", "horizon", "n_days")}
         data["rows"] = rank(list(job["rows"])).astype(object).where(lambda d: d.notna(), None).to_dict("records")
         tmp = _scan_file(owner).with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -505,12 +507,25 @@ def scan_store():
     return {"jobs": {}, "last_by": {}, "lock": threading.Lock()}
 
 
-def start_scan_job(store, tickers, s, owner):
+def past_trading_days(s, n_days: int) -> list:
+    """The n trading days ending at s.as_of (same clock time each day), taken from SPY's own
+    data so weekends and holidays are skipped."""
+    intraday = s.interval in D.INTRADAY
+    spy = D.get_history("SPY", s.interval if intraday else "1d")
+    idx = spy.index.tz_convert("America/New_York") if spy.index.tz is not None else spy.index
+    days = sorted({d for d in idx.date if d <= s.as_of.date()})[-n_days:]
+    t = s.as_of.strftime("%H:%M")
+    return [pd.Timestamp(f"{d} {t}", tz="America/New_York") for d in days]
+
+
+def start_scan_job(store, tickers, s, owner, n_days: int = 1):
     jid = uuid.uuid4().hex[:8]
-    job = {"status": "running", "rows": [], "n": len(tickers), "done": 0, "current": tickers[0],
-           "started": time.time(), "finished": None, "cancel": False, "tickers": list(tickers),
-           "owner": owner,
+    multi = s.as_of is not None and n_days > 1
+    job = {"status": "running", "rows": [], "n": len(tickers) * (n_days if multi else 1), "done": 0,
+           "current": tickers[0], "started": time.time(), "finished": None, "cancel": False,
+           "tickers": list(tickers), "owner": owner,
            "as_of": s.as_of.strftime("%d/%m/%Y %H:%M") if s.as_of is not None else None,
+           "n_days": n_days if multi else 1,
            "horizon": horizon_text(s.interval, s.horizon)}
     with store["lock"]:
         for k in [k for k, v in store["jobs"].items() if time.time() - v["started"] > 6 * 3600]:
@@ -520,19 +535,26 @@ def start_scan_job(store, tickers, s, owner):
 
     def run():
         try:
-            market = D.market_regime() if s.use_market else None
-            for i, t in enumerate(tickers):
-                if job["cancel"]:
-                    job["status"] = "cancelled"
-                    break
-                job["current"] = t
-                job["rows"].append(scan_row(t, s, market))
-                job["done"] = i + 1
-                if job["done"] % 5 == 0:
-                    job["finished"] = time.time()
-                    save_last_scan(job)
-            else:
-                job["status"] = "done"
+            moments = past_trading_days(s, n_days) if multi else [s.as_of]
+            job["n"] = len(tickers) * len(moments)
+            for m_ in moments:
+                s_day = dataclasses.replace(s, as_of=m_) if m_ is not None else s
+                market = D.market_regime(m_) if s.use_market else None
+                for t in tickers:
+                    if job["cancel"]:
+                        raise InterruptedError
+                    job["current"] = t + (f" ({m_:%d/%m})" if multi else "")
+                    row = scan_row(t, s_day, market)
+                    if multi:
+                        row = {"תאריך": f"{m_:%d/%m}", **row}
+                    job["rows"].append(row)
+                    job["done"] += 1
+                    if job["done"] % 5 == 0:
+                        job["finished"] = time.time()
+                        save_last_scan(job)
+            job["status"] = "done"
+        except InterruptedError:
+            job["status"] = "cancelled"
         except Exception as e:  # pragma: no cover
             job["status"], job["error"] = "error", str(e)
         job["finished"] = time.time()
@@ -561,7 +583,9 @@ def render_scan_job(job, style_scan):
     else:
         st.error(f"שגיאה בסריקה: {job.get('error')}")
     if job.get("as_of"):
-        st.markdown(f"#### 📅 דוח היסטורי – {job['as_of']} (שעון ניו יורק)")
+        nd = job.get("n_days") or 1
+        st.markdown(f"#### 📅 דוח היסטורי – {job['as_of']} (שעון ניו יורק)"
+                    + (f" · {nd} ימי מסחר אחורה" if nd > 1 else ""))
         st.caption(f"התחזיות חושבו רק מנתונים שהיו ידועים אז. 'שינוי בפועל' = מה קרה "
                    f"{job.get('horizon', '')} אחרי הדוח.")
         rows_ = [r for r in job["rows"] if r.get("צדקה?")]
@@ -574,8 +598,21 @@ def render_scan_job(job, style_scan):
                   f"{hit / len(sig) * 100:.0f}%" if sig else None)
         m2.metric("כיוון נכון (כל המניות)", f"{dhit}/{len(dirs)}",
                   f"{dhit / len(dirs) * 100:.0f}%" if dirs else None)
+        st.caption("'כיוון נכון' נספר רק כשהמערכת נטתה לכיוון כלשהו (3% ומעלה מ-50%). "
+                   "'—' = המערכת אמרה שהיא לא יודעת, וזה לא נחשב טעות.")
         if len(sig) < 10:
-            st.caption("⚠️ מעט מדי איתותים כדי להסיק מסקנה – הרץ על כמה ימים שונים או רשימה גדולה יותר.")
+            st.caption("⚠️ מעט מדי איתותים כדי להסיק מסקנה – הגדל את מספר הימים או את הרשימה.")
+        if nd > 1 and rows_ and "תאריך" in rows_[0]:
+            by = {}
+            for r in rows_:
+                d = by.setdefault(r["תאריך"], [0, 0, 0, 0])
+                if str(r.get("צדקה?", "")).startswith(("✅", "❌")):
+                    d[1] += 1; d[0] += str(r["צדקה?"]).startswith("✅")
+                if r.get("כיוון נכון") in ("✅", "❌"):
+                    d[3] += 1; d[2] += r["כיוון נכון"] == "✅"
+            st.dataframe(pd.DataFrame([{"תאריך": k, "המלצות שצדקו": f"{v[0]}/{v[1]}",
+                                        "כיוון נכון": f"{v[2]}/{v[3]}"} for k, v in by.items()]),
+                         hide_index=True, use_container_width=True)
     if job["rows"]:
         df = rank(list(job["rows"]))
         ss["scan"] = df
@@ -624,6 +661,9 @@ with tab_s:
                    f"{horizon_text(interval, horizon)} אחר כך. "
                    f"באינטרוול {interval} אפשר לחזור עד {max_days} ימים אחורה. "
                    f"חדשות ומסחר מוקדם לא נכללים בדוח היסטורי.")
+        n_days = st.number_input("כמה ימי מסחר לבדוק (אחורה מהתאריך)", 1, 20, 1, key="past_days",
+                                 help="יום אחד = 16 מניות זה בערך מדגם אחד, כי כולן זזות עם השוק. "
+                                      "10 ימים ומעלה נותנים תמונה אמינה.")
         if past_on:
             scan_settings = dataclasses.replace(settings, as_of=as_of)
             st.info(f"📅 מצב דוח היסטורי פעיל – {as_of:%d/%m/%Y %H:%M} ניו יורק. לחץ ▶️ הרץ סריקה.")
@@ -659,11 +699,14 @@ with tab_s:
             sty = sty.map(verdict_cell, subset=["צדקה?"])
         if "AUC מודל" in df:
             sty = sty.map(auc_cell, subset=["AUC מודל"])
-        return sty
+        fmt = {c: ("{:.3f}" if c == "AUC מודל" else "{:.2f}") for c in df.columns
+               if pd.api.types.is_float_dtype(df[c])}
+        return sty.format(fmt, na_rep="—")
 
     store = scan_store()
     if run_scan and wl:
-        jid = start_scan_job(store, wl, scan_settings, OWNER)
+        jid = start_scan_job(store, wl, scan_settings, OWNER,
+                             n_days=int(ss.get("past_days", 1)) if scan_settings.as_of is not None else 1)
         ss["scan_job"] = jid
         try:
             st.query_params["scan"] = jid

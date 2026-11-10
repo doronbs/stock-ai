@@ -29,6 +29,7 @@ class Settings:
     w_tech: float = 0.25
     w_mtf: float = 0.20
     w_pm: float = 0.50
+    min_auc: float = 0.53       # buy/sell only when the model proved at least this AUC on the stock
     as_of: pd.Timestamp | None = None   # run the report "as of" a past moment (NY time)
 
 
@@ -195,7 +196,14 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
     x = I.add_all(raw, intraday)
     session = "regular" if past else market_session()
 
-    model = train_and_predict(x, intraday, s.horizon, s.buy_th, s.sell_th)
+    mkt = None
+    if ticker != "SPY":
+        try:
+            spy = D.get_history("SPY", s.interval, prepost=False)
+            mkt = (D.truncate(spy, s.as_of, daily=not intraday) if past else spy)["Close"]
+        except Exception:
+            mkt = None
+    model = train_and_predict(x, intraday, s.horizon, s.buy_th, s.sell_th, mkt=mkt)
     tech, reasons = technical_votes(x)
     supports, resistances = I.support_resistance(x)
     patterns = I.candle_patterns(x)
@@ -278,6 +286,10 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
         action, lvl = "מכירה", "sell"
     else:
         action, lvl = "המתן / ניטרלי", "hold"
+    auc_v = model["auc"]
+    if lvl != "hold" and (np.isnan(auc_v) or auc_v < s.min_auc):
+        # Quality gate: no recommendation from a model with no proven edge on this stock
+        action, lvl = f"המתן (מודל לא מוכח, AUC {0 if np.isnan(auc_v) else auc_v:.2f})", "hold"
 
     last_close = float(x["Close"].iloc[-1])
     price = last_close
@@ -299,8 +311,9 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
             else:
                 verdict = "⚪ ללא המלצה"
             # direction call for every stock (even neutral ones): p>=50% means "up"
+            lean = abs(p - 0.5) >= 0.03          # the system actually leaned one way
             evaluation.update(exit=exit_price, ret=ret, went_up=went_up, verdict=verdict,
-                              direction_ok=(p >= 0.5) == went_up,
+                              direction_ok=((p >= 0.5) == went_up) if lean else None,
                               exit_time=str(future.index[s.horizon - 1]))
     return Result(ticker=ticker, price=price, last_close=last_close, session=session,
                   evaluation=evaluation,
@@ -330,7 +343,8 @@ def eval_columns(r) -> dict:
     if not e["known"]:
         return {"מחיר אחרי": None, "שינוי בפועל %": None, "צדקה?": "⏳ עוד לא ידוע", "כיוון נכון": None}
     return {"מחיר אחרי": round(e["exit"], 2), "שינוי בפועל %": round(e["ret"], 2),
-            "צדקה?": e["verdict"], "כיוון נכון": "✅" if e["direction_ok"] else "❌"}
+            "צדקה?": e["verdict"],
+            "כיוון נכון": "—" if e["direction_ok"] is None else ("✅" if e["direction_ok"] else "❌")}
 
 
 def scan_row(t: str, s: Settings, market: dict | None) -> dict:
@@ -368,7 +382,12 @@ def rank(rows: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if "סיכוי עלייה %" in df:
         df["_k"] = (df["סיכוי עלייה %"] - 50).abs().fillna(-1)
-        df = df.sort_values("_k", ascending=False).drop(columns="_k")
+        if "תאריך" in df:   # multi-day historical report: newest day first, strongest first within a day
+            order = {d: i for i, d in enumerate(dict.fromkeys(df["תאריך"]))}
+            df["_d"] = df["תאריך"].map(order)
+            df = df.sort_values(["_d", "_k"], ascending=[False, False]).drop(columns=["_k", "_d"])
+        else:
+            df = df.sort_values("_k", ascending=False).drop(columns="_k")
     return df
 
 

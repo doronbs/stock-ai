@@ -21,7 +21,7 @@ from sklearn.preprocessing import StandardScaler
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
-def build_features(x: pd.DataFrame, intraday: bool) -> pd.DataFrame:
+def build_features(x: pd.DataFrame, intraday: bool, mkt: pd.Series | None = None) -> pd.DataFrame:
     """Stationary (scale-free) features from an indicator-enriched frame."""
     c = x["Close"]
     a = x["atr"].replace(0, np.nan)
@@ -52,6 +52,17 @@ def build_features(x: pd.DataFrame, intraday: bool) -> pd.DataFrame:
     f["atr_pct"] = a / c * 100
     f["range_pos"] = (c - x["Low"].rolling(20).min()) / (
         x["High"].rolling(20).max() - x["Low"].rolling(20).min()).replace(0, np.nan) - 0.5
+    if mkt is not None:
+        # Market context: most single-stock moves are the market moving. SPY returns over the
+        # same bars and the stock's strength relative to SPY (only past/current bars → no look-ahead).
+        m = mkt.reindex(x.index).ffill(limit=3)
+        for n in (1, 6, 12, 24):
+            mr = np.log(m / m.shift(n))
+            f[f"mkt_ret_{n}"] = mr
+            if n >= 6:
+                f[f"rel_{n}"] = f[f"ret_{n}"] - mr
+        mret = np.log(m / m.shift(1))
+        f["beta_60"] = (f["ret_1"].rolling(60).cov(mret) / mret.rolling(60).var().replace(0, np.nan)).clip(-3, 5)
     if intraday and isinstance(x.index, pd.DatetimeIndex):
         mins = x.index.hour * 60 + x.index.minute
         f["tod_sin"] = np.sin(2 * np.pi * (mins - 570) / 390)
@@ -61,10 +72,18 @@ def build_features(x: pd.DataFrame, intraday: bool) -> pd.DataFrame:
     return f.replace([np.inf, -np.inf], np.nan)
 
 
-def make_labels(close: pd.Series, horizon: int, threshold: float = 0.0) -> tuple[pd.Series, pd.Series]:
+def make_labels(close: pd.Series, horizon: int, noise: float = 0.15) -> tuple[pd.Series, pd.Series]:
+    """y=1 if the price is clearly higher after `horizon` bars, 0 if clearly lower.
+    Tiny moves (flat bars, ties – very common intraday) are dropped instead of being counted
+    as 'down', which used to bias every prediction slightly below 50%. The noise band is
+    `noise` × the typical |move| measured only on PAST labels (expanding median, shifted)."""
     fwd = close.shift(-horizon) / close - 1
-    y = (fwd > threshold).astype(float).where(fwd.notna())
-    return y, fwd
+    band = fwd.abs().expanding(min_periods=50).median().shift(horizon) * noise
+    band = band.bfill().fillna(0)
+    y = pd.Series(np.nan, index=close.index)
+    y[fwd > band] = 1.0
+    y[fwd < -band] = 0.0
+    return y.where(fwd.notna()), fwd
 
 
 class _Ensemble:
@@ -109,8 +128,10 @@ def walk_forward(X: pd.DataFrame, y: pd.Series, horizon: int, n_splits: int = 6,
 
 
 def train_and_predict(x: pd.DataFrame, intraday: bool, horizon: int,
-                      buy_th: float = 0.6, sell_th: float = 0.4) -> dict:
-    feats = build_features(x, intraday)
+                      buy_th: float = 0.6, sell_th: float = 0.4, mkt: pd.Series | None = None) -> dict:
+    feats = build_features(x, intraday, mkt)
+    # drop feature columns that are entirely missing (e.g. no SPY data for this interval)
+    feats = feats.loc[:, feats.notna().mean() > 0.5]
     y, fwd = make_labels(x["Close"], horizon)
     data = feats.join(y.rename("y")).join(fwd.rename("fwd"))
     valid = data.dropna(subset=list(feats.columns))
