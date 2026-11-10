@@ -357,7 +357,8 @@ function renderScan() {
     return `<div class="scanrow" data-t="${esc(r["מניה"])}"${hot}>
       <div><div class="t">${esc(r["מניה"])}</div><div class="small muted ltr">${fmt(r["מחיר"])}</div></div>
       <div><div class="small"><span class="${cls(r["שינוי יומי %"])}">${pct(r["שינוי יומי %"])}</span>
-        ${ext != null ? ` · מוקדם <span class="${cls(ext)}">${pct(ext)}</span>` : ""} · AUC ${fmt(r["AUC מודל"], 2)}</div>
+        ${ext != null ? ` · מוקדם <span class="${cls(ext)}">${pct(ext)}</span>` : ""} · ${r["AUC מודל"] > 0.58
+          ? `<span class="pill" style="background:#16a34a">AUC ${fmt(r["AUC מודל"], 2)} ✓</span>` : `AUC ${fmt(r["AUC מודל"], 2)}`}</div>
         <div class="pbar"><i style="width:${p}%;background:${COLORS[lvl]}"></i></div></div>
       <div style="text-align:center"><div style="font-weight:800">${fmt(p, 0)}%</div><span class="pill" style="background:${COLORS[lvl]}">${esc(r["המלצה"])}</span></div>
     </div>`;

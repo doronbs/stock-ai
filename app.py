@@ -560,7 +560,8 @@ def render_scan_job(job, style_scan):
         df = rank(list(job["rows"]))
         ss["scan"] = df
         st.dataframe(style_scan(df), use_container_width=True, hide_index=True, height=560)
-        st.caption("ממוין לפי חוזק האיתות. שורה ירוקה = 60%+ לעלייה. AUC מעל 0.55 = למודל יתרון מוכח.")
+        st.caption("ממוין לפי חוזק האיתות. שורה ירוקה = 60%+ לעלייה. "
+                   "AUC בירוק כהה = מעל 0.58, למודל יתרון מוכח וחזק במניה הזו.")
 
 
 with tab_s:
@@ -596,7 +597,15 @@ with tab_s:
             if isinstance(v, (int, float)) and not pd.isna(v) and v <= sell_th * 100:
                 return "background-color: rgba(224,87,59,.35)"
             return ""
-        return df.style.apply(row_color, axis=1).map(sell_cell, subset=["סיכוי עלייה %"])
+        def auc_cell(v):
+            # strong, proven model for this stock → bold green AUC cell
+            if isinstance(v, (int, float)) and not pd.isna(v) and v > 0.58:
+                return "background-color: #16a34a; color: white; font-weight: 700"
+            return ""
+        sty = df.style.apply(row_color, axis=1).map(sell_cell, subset=["סיכוי עלייה %"])
+        if "AUC מודל" in df:
+            sty = sty.map(auc_cell, subset=["AUC מודל"])
+        return sty
 
     store = scan_store()
     if run_scan and wl:
