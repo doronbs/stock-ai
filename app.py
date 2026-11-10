@@ -280,9 +280,16 @@ if not USER:
                 st.rerun()
             else:
                 st.error("רק אותיות באנגלית / ספרות")
-elif ss.get("_user_tip") is None:
-    ss["_user_tip"] = True
-    st.toast(f"מחובר כ-{USER}. כדי שהאייקון במסך הבית יזכור אותך, הוסף אותו מחדש מהדף הזה.", icon="👤")
+else:
+    # Greeting on top of the screen with the user name, Israel time and market session
+    from engine.premarket import SESSION_HE as _SH, market_session as _ms
+    _h = datetime.now(IL).hour
+    _hello = "בוקר טוב" if 5 <= _h < 12 else "צהריים טובים" if _h < 17 else "ערב טוב" if _h < 22 else "לילה טוב"
+    st.markdown(
+        f"<div style='padding:10px 14px;border-radius:12px;background:rgba(34,197,94,.10);"
+        f"border:1px solid rgba(34,197,94,.35);margin-bottom:6px'>"
+        f"👤 <b>{_hello}, {USER}</b> · <span style='opacity:.75'>{datetime.now(IL):%H:%M} · {_SH[_ms()]}</span></div>",
+        unsafe_allow_html=True)
 
 # Scanner first: the app opens on the last scan
 tab_s, tab_a, tab_m, tab_n, tab_b, tab_h = st.tabs(
