@@ -30,6 +30,8 @@ class Settings:
     w_mtf: float = 0.20
     w_pm: float = 0.50
     min_auc: float = 0.53       # buy/sell only when the model proved at least this AUC on the stock
+    noise: float = 0.15         # label noise band (see model.make_labels) – set by the auto-tuner
+    use_mkt: bool = True        # SPY market features – set by the auto-tuner
     as_of: pd.Timestamp | None = None   # run the report "as of" a past moment (NY time)
 
 
@@ -197,13 +199,13 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
     session = "regular" if past else market_session()
 
     mkt = None
-    if ticker != "SPY":
+    if ticker != "SPY" and s.use_mkt:
         try:
             spy = D.get_history("SPY", s.interval, prepost=False)
             mkt = (D.truncate(spy, s.as_of, daily=not intraday) if past else spy)["Close"]
         except Exception:
             mkt = None
-    model = train_and_predict(x, intraday, s.horizon, s.buy_th, s.sell_th, mkt=mkt)
+    model = train_and_predict(x, intraday, s.horizon, s.buy_th, s.sell_th, mkt=mkt, noise=s.noise)
     tech, reasons = technical_votes(x)
     supports, resistances = I.support_resistance(x)
     patterns = I.candle_patterns(x)

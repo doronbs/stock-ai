@@ -171,7 +171,8 @@ with st.sidebar:
 
 settings = Settings(interval=interval, horizon=horizon, buy_th=buy_th, sell_th=sell_th, min_auc=min_auc,
                     use_news=use_news, use_market=use_market, use_mtf=use_mtf, prepost=prepost,
-                    use_premarket=use_pm)
+                    use_premarket=use_pm, noise=float(cfg.get("noise", 0.15)),
+                    use_mkt=bool(cfg.get("use_mkt", True)))
 tg_cfg = {"telegram_token": tg_tok, "telegram_chat_id": tg_chat}
 
 
@@ -295,8 +296,9 @@ else:
         unsafe_allow_html=True)
 
 # Scanner first: the app opens on the last scan
-tab_s, tab_a, tab_m, tab_n, tab_b, tab_h = st.tabs(
-    ["🔎 סורק מניות", "📈 ניתוח מניה", "🌎 מגמות שוק", "📰 חדשות", "🧪 בדיקה היסטורית", "❓ איך זה עובד"])
+tab_s, tab_a, tab_m, tab_n, tab_b, tab_t, tab_h = st.tabs(
+    ["🔎 סורק מניות", "📈 ניתוח מניה", "🌎 מגמות שוק", "📰 חדשות", "🧪 בדיקה היסטורית",
+     "🔧 כיול ובדיקה", "❓ איך זה עובד"])
 
 
 def render_analysis():
@@ -824,6 +826,132 @@ with tab_b:
             rel["actual_up_rate"] = (rel["actual_up_rate"] * 100).round(1)
             st.dataframe(rel.rename(columns={"bucket": "טווח הסתברות", "actual_up_rate": "% עלייה בפועל",
                                              "n": "מספר מקרים"}), hide_index=True)
+
+
+# ───── Auto-tuning & self-tests ─────
+def _tune_file(owner: str) -> Path:
+    return SCAN_DIR / f"tune_{owner}.json"
+
+
+def start_tune_job(store, tickers, s, owner):
+    from engine.tuner import tune
+    job = {"status": "running", "progress": 0.0, "current": "", "started": time.time(),
+           "owner": owner, "interval": s.interval, "horizon": s.horizon, "tickers": tickers}
+    store.setdefault("tunes", {})[owner] = job
+
+    def run():
+        try:
+            def prog(p, t):
+                job["progress"], job["current"] = p, t
+            res = tune(tickers, s.interval, s.horizon, progress=prog)
+            job["result"] = {k: v for k, v in res.items()}
+            job["status"] = "done" if res.get("ok") else "error"
+            job["error"] = res.get("error")
+        except Exception as e:  # pragma: no cover
+            job["status"], job["error"] = "error", str(e)
+        job["finished"] = time.time()
+        if not owner.startswith("guest-"):
+            try:
+                SCAN_DIR.mkdir(exist_ok=True)
+                _tune_file(owner).write_text(json.dumps(job, ensure_ascii=False, default=float),
+                                            encoding="utf-8")
+            except Exception:
+                pass
+    threading.Thread(target=run, daemon=True).start()
+
+
+def render_tune(job):
+    if job["status"] == "running":
+        st.progress(job["progress"], f"🔄 מכייל ברקע – {job['current']} ({job['progress'] * 100:.0f}%). "
+                                     "אפשר לעבור לאפליקציה אחרת ולחזור.")
+        return
+    if job["status"] == "error":
+        st.error(f"הכיול נכשל: {job.get('error')}")
+        return
+    res = job["result"]
+    b = res["best"]
+    st.markdown(f"**כויל ב-{il_time(job['finished'], '%d/%m %H:%M')}** · {res['n_stocks']} מניות · "
+                f"אינטרוול {job['interval']} · אופק {horizon_text(job['interval'], job['horizon'])}")
+    c1, c2 = st.columns(2)
+    c1.metric("תקופת בחירה (נראתה בכיול)", f"{b['sel_rate'] * 100:.1f}%", f"{b['sel_hits']}/{b['sel_n']} איתותים",
+              delta_color="off")
+    tr = b["test_rate"]
+    c2.metric("תקופת מבחן (לא נראתה!)", "—" if tr != tr else f"{tr * 100:.1f}%",
+              f"{b['test_hits']}/{b['test_n']} איתותים", delta_color="off")
+    if b["proven"]:
+        st.success(f"✅ יתרון מובהק: גם בגבול התחתון (90% ביטחון) ההצלחה בתקופת המבחן היא "
+                   f"{b['test_low'] * 100:.0f}%, מעל 50%.")
+    else:
+        st.warning("⚠️ אין יתרון מוכח בתקופת המבחן – ההבדל מ-50% יכול להיות מזל. "
+                   "האחוז בתקופת הבחירה תמיד נראה טוב יותר כי בו נבחרו ההגדרות; המספר שקובע הוא תקופת המבחן.")
+    st.caption(f"לשם השוואה: 'תמיד לנחש עלייה' הצליח ב-{res['baseline_up'] * 100:.1f}% מהנרות בתקופת המבחן.")
+    st.markdown(f"**ההגדרות שנבחרו:** סף קנייה {b['buy_th']:.2f} · סף מכירה {1 - b['buy_th']:.2f} · "
+                f"AUC מינימלי {b['min_auc']:.2f} · רצועת רעש {b['noise']} · "
+                f"נתוני שוק (SPY) {'כן' if b['use_mkt'] else 'לא'}")
+    top = pd.DataFrame([{"סף": r["buy_th"], "AUC מינ'": r["min_auc"], "רעש": r["noise"],
+                         "SPY": "כן" if r["use_mkt"] else "לא",
+                         "בחירה %": round(r["sel_rate"] * 100, 1), "איתותים (בחירה)": r["sel_n"],
+                         "מבחן %": None if r["test_rate"] != r["test_rate"] else round(r["test_rate"] * 100, 1),
+                         "איתותים (מבחן)": r["test_n"], "מובהק": "✅" if r["proven"] else "—"}
+                        for r in res["top"]])
+    with st.expander("5 ההגדרות הטובות בתקופת הבחירה"):
+        st.dataframe(top, hide_index=True, use_container_width=True)
+    if st.button("✅ החל את ההגדרות האלה על האפליקציה", key="apply_tune", type="primary",
+                 disabled=not USER):
+        cfg.update(res["settings"])
+        save_config(cfg, USER)
+        st.success("נשמר. הסורק והניתוח ישתמשו מעכשיו בהגדרות האלה.")
+        st.rerun()
+    if not USER:
+        st.caption("כדי לשמור הגדרות צריך שם משתמש.")
+
+
+with tab_t:
+    st.markdown("### 🔧 כיול אוטומטי ובדיקת תקינות")
+    st.markdown("#### 1️⃣ בדיקת תקינות – שהמערכת לא 'מרמה'")
+    st.caption("שלוש בדיקות על נתונים אמיתיים: (1) משנים את כל המחירים שאחרי תאריך הדוח – התחזית חייבת "
+               "להישאר זהה; (2) מערבבים את התוצאות ההיסטוריות – ה-AUC חייב לרדת ל-0.50; "
+               "(3) על מחירים אקראיים – אסור למערכת למצוא יתרון.")
+    st_t = st.text_input("מניה לבדיקה", value="NVDA", key="selftest_ticker").upper().strip()
+    if st.button("▶️ הרץ בדיקת תקינות", key="run_selftest"):
+        from engine.selftest import run_all
+        with st.spinner("בודק... (חצי דקה עד דקה)"):
+            ss["selftest"] = run_all(st_t, settings)
+    for r in ss.get("selftest", []):
+        (st.success if r["passed"] else st.error)(f"{'✅' if r['passed'] else '❌'} **{r['name']}** – {r['detail']}")
+
+    st.divider()
+    st.markdown("#### 2️⃣ כיול אוטומטי – מציאת ההגדרות הטובות ביותר")
+    st.caption("המערכת מנסה 6 גרסאות מודל × 6 ספי קנייה × 5 ספי AUC (180 צירופים). הבחירה נעשית על "
+               "החלק הראשון של ההיסטוריה, והציון האמיתי נמדד על החלק האחרון שהכיול לא ראה. "
+               "כך אי אפשר 'לכייל עד שזה נראה טוב' על אותם נתונים.")
+    groups_t = ["רשימת המעקב שלי"] + list(GROUPS)
+    gsel = st.selectbox("על אילו מניות לכייל", groups_t, key="tune_group")
+    tickers_t = cfg["watchlist"] if gsel == groups_t[0] else GROUPS[gsel]
+    tickers_t = list(dict.fromkeys(tickers_t))[:15]
+    st.caption(f"{len(tickers_t)} מניות: {', '.join(tickers_t)} · אינטרוול {interval} · "
+               f"אופק {horizon_text(interval, horizon)} · זמן משוער: {max(1, len(tickers_t) * 20 // 60)}–"
+               f"{max(2, len(tickers_t) * 40 // 60)} דקות")
+    store_t = scan_store()
+    tj = store_t.setdefault("tunes", {}).get(OWNER)
+    if st.button("▶️ התחל כיול", key="run_tune", type="primary",
+                 disabled=bool(tj and tj["status"] == "running")):
+        start_tune_job(store_t, tickers_t, settings, OWNER)
+        tj = store_t["tunes"][OWNER]
+    if tj is None:
+        try:
+            tj = json.loads(_tune_file(OWNER).read_text(encoding="utf-8"))
+        except Exception:
+            tj = None
+    if tj:
+        if tj["status"] == "running":
+            def live_t():
+                render_tune(tj)
+                if tj["status"] != "running":
+                    st.rerun()
+            st.fragment(run_every=3)(live_t)()
+        else:
+            render_tune(tj)
 
 
 # ───── Help ─────
