@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 settings_*.json
 user_data/
+positions.json
+positions_*.json

@@ -30,7 +30,8 @@ def _refresh_engine():
     updated on the server, reload any engine module whose file changed, in dependency
     order, so new functions are always available without a manual reboot."""
     order = ["engine.data", "engine.indicators", "engine.sentiment", "engine.model",
-             "engine.premarket", "engine.universe", "engine.alerts", "engine.analyzer"]
+             "engine.premarket", "engine.universe", "engine.alerts", "engine.analyzer",
+             "engine.positions"]
     changed = False
     for name in order:
         mod = sys.modules.get(name)
@@ -50,6 +51,7 @@ from engine.alerts import format_alert, load_config, save_config, send_telegram 
 from engine.analyzer import (Settings, analyze, day_change, quick_scan, rank,  # noqa: E402
                              scan_row)
 from engine.universe import GROUPS
+from engine import positions as POS  # noqa: E402
 
 IL = ZoneInfo("Asia/Jerusalem")
 
@@ -296,8 +298,8 @@ else:
         unsafe_allow_html=True)
 
 # Scanner first: the app opens on the last scan
-tab_s, tab_a, tab_m, tab_n, tab_b, tab_t, tab_h = st.tabs(
-    ["🔎 סורק מניות", "📈 ניתוח מניה", "🌎 מגמות שוק", "📰 חדשות", "🧪 בדיקה היסטורית",
+tab_s, tab_a, tab_p, tab_m, tab_n, tab_b, tab_t, tab_h = st.tabs(
+    ["🔎 סורק מניות", "📈 ניתוח מניה", "💼 הפוזיציות שלי", "🌎 מגמות שוק", "📰 חדשות", "🧪 בדיקה היסטורית",
      "🔧 כיול ובדיקה", "❓ איך זה עובד"])
 
 
@@ -785,6 +787,163 @@ def gated(tab, key, label, fn):
             fn()
         else:
             st.caption("הנתונים נטענים רק אחרי לחיצה")
+
+
+# ───── My positions – exit advisor ─────
+def _pos_owner():
+    return USER or OWNER
+
+
+def render_positions():
+    owner = _pos_owner()
+    items = POS.load_positions(owner)
+    st.markdown("#### 💼 הפוזיציות שלי – מתי למכור ולממש רווח")
+    st.caption("מזינים מניה שקנית ואת מחיר הקנייה. המערכת בונה תוכנית יציאה (סטופ, יעד ראשון למכירת חצי, "
+               "יעד סופי וסטופ נגרר) לפי התנודתיות היומית וההתנגדויות של המניה, ובודקת אותה מול המחיר החי "
+               "ומודל ה-ML.")
+
+    with st.expander("➕ הוסף פוזיציה", expanded=not items):
+        with st.form("add_pos", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            t = c1.text_input("טיקר", placeholder="NVDA")
+            entry = c2.number_input("מחיר קנייה ($)", min_value=0.0, step=0.01, format="%.2f")
+            qty = c3.number_input("כמות מניות", min_value=0.0, step=1.0)
+            c4, c5, c6 = st.columns(3)
+            opened = c4.date_input("תאריך קנייה", value=datetime.now(IL).date())
+            stop_pct = c5.number_input("סטופ % (0 = אוטומטי)", min_value=0.0, max_value=50.0, step=0.5)
+            tgt_pct = c6.number_input("יעד רווח % (0 = אוטומטי)", min_value=0.0, max_value=300.0, step=1.0)
+            if st.form_submit_button("שמור פוזיציה", type="primary"):
+                try:
+                    items.append(POS.clean_position({"ticker": t, "entry": entry, "qty": qty,
+                                                     "opened": opened.isoformat(),
+                                                     "stop_pct": stop_pct, "target_pct": tgt_pct}))
+                    POS.save_positions(items, owner)
+                    ss.pop("pos_results", None)
+                    st.success(f"{t.upper()} נוספה")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
+    if not items:
+        st.info("אין עדיין פוזיציות. הוסף מניה שקנית למעלה.")
+        return
+
+    b1, b2 = st.columns([1, 1])
+    run = b1.button("🔄 בדוק עכשיו את כל הפוזיציות", type="primary", use_container_width=True)
+    auto = b2.toggle("בדיקה אוטומטית לפי תדירות הרענון", key="pos_auto",
+                     help="משתמש בתדירות הרענון שבסרגל הצד")
+    if run or (auto and refresh and time.time() - ss.get("pos_checked_at", 0) > refresh * 60) \
+            or (auto and "pos_results" not in ss):
+        res = {}
+        bar = st.progress(0.0, text="בודק...")
+        market = None
+        try:
+            market = D.market_regime()
+        except Exception:
+            pass
+        for i, p in enumerate(items):
+            bar.progress((i + 1) / len(items), text=f"בודק {p['ticker']}...")
+            try:
+                res[p["id"]] = POS.check_position(p, settings, market=market)
+            except Exception as e:
+                res[p["id"]] = {"error": str(e), "ticker": p["ticker"]}
+        bar.empty()
+        ss["pos_results"] = res
+        ss["pos_checked_at"] = time.time()
+        # Telegram + toast only when a position's verdict CHANGES to an action
+        sent = ss.setdefault("pos_alerted", {})
+        for pid, a in res.items():
+            if "error" in a:
+                continue
+            if a["code"] != "HOLD" and sent.get(pid) != a["code"]:
+                st.toast(f"{a['ticker']}: {a['verdict']}", icon="🔔")
+                send_telegram(POS.format_exit_alert(a), tg_cfg)
+            sent[pid] = a["code"]
+
+    res = ss.get("pos_results", {})
+    if ss.get("pos_checked_at"):
+        st.caption(f"נבדק לאחרונה: {il_time(ss['pos_checked_at'], '%H:%M:%S')}"
+                   + (f" | בדיקה אוטומטית כל {refresh} דק'" if auto and refresh else ""))
+
+    ok = [res[p["id"]] for p in items if p["id"] in res and "error" not in res[p["id"]]]
+    if ok:
+        tot_cost = sum(a["entry"] * a["qty"] for a in ok)
+        tot_pnl = sum(a["pnl"] for a in ok)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("רווח/הפסד כולל", f"${tot_pnl:,.0f}",
+                  f"{(tot_pnl / tot_cost * 100) if tot_cost else 0:+.2f}%")
+        m2.metric("דורשות פעולה", sum(a["code"] != "HOLD" for a in ok))
+        m3.metric("פוזיציות", len(items))
+
+    colors = {"sell": "239,68,68", "partial": "249,115,22", "tighten": "234,179,8", "hold": "34,197,94"}
+    for p in items:
+        a = res.get(p["id"])
+        with st.container(border=True):
+            if not a:
+                st.markdown(f"**{p['ticker']}** · קנייה {p['entry']:.2f} × {p['qty']:g} · {p['opened']}")
+                st.caption("לחץ \"בדוק עכשיו\" כדי לקבל המלצה")
+            elif "error" in a:
+                st.markdown(f"**{p['ticker']}**")
+                st.error(f"שגיאה: {a['error']}")
+            else:
+                rgb = colors[a["level"]]
+                st.markdown(
+                    f"<div style='padding:10px 14px;border-radius:10px;background:rgba({rgb},.12);"
+                    f"border:1px solid rgba({rgb},.5)'><b style='font-size:1.15em'>{a['ticker']}</b> "
+                    f"&nbsp;·&nbsp; <b>{a['verdict']}</b></div>", unsafe_allow_html=True)
+                c = st.columns(4)
+                c[0].metric("מחיר עכשיו", f"{a['price']:.2f}", f"{a['pnl_pct']:+.2f}%")
+                c[1].metric("רווח/הפסד", f"${a['pnl']:,.0f}", f"{a['r_mult']:+.1f}R", delta_color="off")
+                c[2].metric(a["stop_kind"], f"{a['stop']:.2f}", f"{a['to_stop_%']:+.1f}%", delta_color="off")
+                c[3].metric("יעד הבא", f"{a['next_target']:.2f}", f"{a['to_target_%']:+.1f}%", delta_color="off")
+                for r_ in a["reasons"]:
+                    st.markdown(f"- {r_}")
+                # where the price sits between the stop and the final target
+                lo, hi = a["stop"], a["tp2"]
+                frac = float(np.clip((a["price"] - lo) / (hi - lo), 0, 1)) if hi > lo else 0.0
+                st.progress(frac, text=f"סטופ {lo:.2f}  ←  מחיר {a['price']:.2f}  →  יעד סופי {hi:.2f}")
+                extra = f"יעד 1 (מכירת חצי): {a['tp1']:.2f}{' ✅ בוצע' if a['tp1_done'] else ''} · " \
+                        f"שיא מאז הקנייה: {a['high_since']:.2f} · ATR יומי: {a['atr']:.2f} · RSI יומי: {a['rsi_d']:.0f}"
+                if a.get("p_up") is not None:
+                    extra += f" · סיכוי עלייה (מודל): {a['p_up'] * 100:.0f}%"
+                st.caption(extra)
+            k1, k2, k3 = st.columns(3)
+            if not p.get("tp1_done") and k1.button("✅ מכרתי חצי", key=f"half_{p['id']}",
+                                                     use_container_width=True):
+                p["tp1_done"] = True
+                p["qty"] = round(p["qty"] / 2, 4)
+                POS.save_positions(items, owner)
+                ss.get("pos_results", {}).pop(p["id"], None)
+                st.rerun()
+            if k2.button("📈 לניתוח המלא", key=f"an_{p['id']}", use_container_width=True):
+                ss["active_ticker"] = p["ticker"]
+                st.toast("עבור ללשונית 📈 ניתוח מניה")
+            if k3.button("🗑️ מכרתי הכל / מחק", key=f"del_{p['id']}", use_container_width=True):
+                POS.save_positions([x for x in items if x["id"] != p["id"]], owner)
+                ss.get("pos_results", {}).pop(p["id"], None)
+                st.rerun()
+
+    with st.expander("💾 גיבוי ושחזור"):
+        st.caption("בענן (Streamlit) הקובץ עלול להימחק כשהאפליקציה מתאתחלת. העתק את הגיבוי ושמור אותו, "
+                   "ואם הפוזיציות נעלמו, הדבק אותו כאן.")
+        st.code(json.dumps(items, ensure_ascii=False), language="json")
+        txt = st.text_area("הדבק גיבוי לשחזור", key="pos_restore")
+        if st.button("שחזר", key="pos_restore_btn") and txt.strip():
+            try:
+                POS.save_positions([POS.clean_position(x) for x in json.loads(txt)], owner)
+                ss.pop("pos_results", None)
+                st.rerun()
+            except Exception as e:
+                st.error(f"גיבוי לא תקין: {e}")
+
+    st.caption("⚠️ כלי עזר, לא ייעוץ השקעות. הנתונים מ-Yahoo Finance ועלולים להתעכב בכמה דקות.")
+
+
+with tab_p:
+    if ss.get("pos_auto") and refresh:
+        st.fragment(run_every=refresh * 60)(render_positions)()   # re-check on the refresh timer
+    else:
+        render_positions()
 
 
 gated(tab_m, "show_market", "▶️ טען נתוני שוק", render_market)

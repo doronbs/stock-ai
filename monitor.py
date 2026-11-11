@@ -13,6 +13,7 @@ from datetime import datetime
 from engine import data as D
 from engine.alerts import beep, format_alert, load_config, send_telegram
 from engine.analyzer import Settings, analyze
+from engine.positions import check_position, format_exit_alert, load_positions
 
 
 def main():
@@ -27,10 +28,13 @@ def main():
     ap.add_argument("--always", action="store_true", help="scan even when US market is closed")
     ap.add_argument("--regular-only", action="store_true",
                     help="skip pre-market / after-hours (default: scan 04:00-20:00 New York)")
+    ap.add_argument("--user", default=None,
+                    help="also watch this app user's positions (positions_<user>.json); default positions.json")
     a = ap.parse_args()
 
     s = Settings(interval=a.interval, horizon=a.horizon, buy_th=cfg["buy_th"], sell_th=cfg["sell_th"])
     last_signal: dict[str, str] = {}
+    last_exit: dict[str, str] = {}
     print(f"StockAI monitor | {len(a.tickers)} tickers | every {a.every} min | {a.interval} | H={a.horizon}")
     while True:
         if not a.always and not D.is_market_open(extended=not a.regular_only):
@@ -55,6 +59,21 @@ def main():
                 beep()
                 send_telegram(msg, cfg)
             last_signal[t] = r.action_level if strong else "none"
+        # Open positions: alert when the exit advisor's verdict changes to an action
+        for pos in load_positions(a.user):
+            try:
+                ex = check_position(pos, s, market=market)
+            except Exception as e:
+                print(f"{pos['ticker']} (position): error {e}")
+                continue
+            print(f"{datetime.now():%H:%M:%S} 💼 {ex['ticker']:6} {ex['price']:10.2f}  "
+                  f"{ex['pnl_pct']:+6.2f}%  {ex['verdict']}")
+            if ex["code"] != "HOLD" and last_exit.get(pos["id"]) != ex["code"]:
+                msg = format_exit_alert(ex)
+                print(">>> SELL ALERT\n" + msg.replace("<b>", "").replace("</b>", ""))
+                beep()
+                send_telegram(msg, cfg)
+            last_exit[pos["id"]] = ex["code"]
         time.sleep(a.every * 60)
 
 
