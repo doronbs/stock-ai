@@ -32,6 +32,7 @@ class Settings:
     min_auc: float = 0.53       # buy/sell only when the model proved at least this AUC on the stock
     noise: float = 0.15         # label noise band (see model.make_labels) – set by the auto-tuner
     use_mkt: bool = True        # SPY market features – set by the auto-tuner
+    use_fundamentals: bool = True   # layers 4–6: reports, financial health, analysts/insiders
     as_of: pd.Timestamp | None = None   # run the report "as of" a past moment (NY time)
 
 
@@ -57,6 +58,7 @@ class Result:
     premarket: dict | None = None
     last_close: float = 0.0
     evaluation: dict | None = None
+    layers: list = field(default_factory=list)      # 6-layer scorecard
 
 
 def _logit(p):
@@ -66,6 +68,40 @@ def _logit(p):
 
 def _sig(z):
     return 1 / (1 + np.exp(-z))
+
+
+def horizon_days(s: "Settings") -> float:
+    if s.interval in D.INTRADAY:
+        mins = {"1m": 1, "2m": 2, "5m": 5, "15m": 15, "30m": 30, "60m": 60, "90m": 90}[s.interval]
+        return mins * s.horizon / 390
+    return s.horizon * (5 if s.interval == "1wk" else 1)
+
+
+def build_layers(market, x, tech, reasons, mtf, model, pm, fund) -> list[dict]:
+    """The 6-layer scorecard (each score in [-1, 1]) shown to the user."""
+    L = []
+    mk_notes = list((market or {}).get("notes", []))
+    mk_score = (market or {}).get("score", 0.0)
+    if fund and fund.get("sector"):
+        mk_notes.append(fund["sector"]["note"])
+        mk_score = float(np.clip(0.7 * mk_score + 0.3 * fund["sector"]["score"], -1, 1))
+    L.append({"name": "1. מצב השוק", "score": mk_score, "notes": mk_notes})
+    ch_notes = reasons[:6] + (mtf["notes"] if mtf else [])
+    ch_score = float(np.clip(0.7 * tech + 0.3 * (mtf["score"] if mtf else 0), -1, 1))
+    L.append({"name": "2. הגרף", "score": ch_score, "notes": ch_notes})
+    h_notes = [f"מודל למידה על ההיסטוריה של המניה: {model['p_up'] * 100:.1f}% "
+               f"(AUC {model['auc']:.3f} על {model['n_oos']:,} תחזיות עיוורות)"]
+    if pm and pm.get("notes"):
+        h_notes += pm["notes"][:2]
+    L.append({"name": "3. היסטוריה ומצבים דומים", "score": float(np.clip((model["p_up"] - 0.5) * 4, -1, 1)),
+              "notes": h_notes})
+    if fund:
+        for key, nm in (("reports", "4. דוחות כספיים"), ("health", "5. מצב פיננסי ותמחור"),
+                        ("publications", "6. פרסומים והמלצות")):
+            f = fund[key]
+            L.append({"name": nm, "score": f["score"], "notes": f["notes"], "metrics": f["metrics"],
+                      "has_data": f["has_data"]})
+    return L
 
 
 def technical_votes(x: pd.DataFrame) -> tuple[float, list]:
@@ -276,7 +312,35 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
     adj += pat_adj
     if pat_adj:
         br["תבניות נרות"] = pat_adj
-    p = float(np.clip(_sig(z + adj), 0.03, 0.97))
+    # ── Layers 4–6 (point-in-time fundamentals). Their weight grows with the forecast horizon:
+    # within a day prices are driven by flow; over weeks, by the business.
+    hdays = horizon_days(s)
+    fund = None
+    if s.use_fundamentals:
+        try:
+            from .fundamentals import analyze_fundamentals
+            fund = analyze_fundamentals(ticker, s.as_of, None, hdays)
+        except Exception:
+            fund = None
+    if fund:
+        wf = 0.08 if hdays < 1 else 0.15 if hdays <= 5 else 0.30 if hdays <= 20 else 0.45
+        for key, label in (("reports", "דוחות כספיים"), ("health", "מצב פיננסי ותמחור"),
+                           ("publications", "אנליסטים ובעלי עניין")):
+            L = fund[key]
+            if L["has_data"] and L["score"]:
+                a_ = wf * L["score"]
+                adj += a_
+                br[label] = a_
+        if fund.get("sector"):
+            a_ = 0.15 * fund["sector"]["score"]
+            adj += a_
+            br["חוזק הסקטור"] = a_
+    zf = z + adj
+    if fund and fund["publications"]["metrics"].get("earnings_in_horizon"):
+        # an earnings report inside the horizon makes any forecast less certain
+        br["דוח בתוך האופק (הקטנת ודאות)"] = -0.4 * zf
+        zf *= 0.6
+    p = float(np.clip(_sig(zf), 0.03, 0.97))
 
     if p >= max(s.buy_th + 0.1, 0.7):
         action, lvl = "קנייה חזקה", "strong_buy"
@@ -317,7 +381,8 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
             evaluation.update(exit=exit_price, ret=ret, went_up=went_up, verdict=verdict,
                               direction_ok=((p >= 0.5) == went_up) if lean else None,
                               exit_time=str(future.index[s.horizon - 1]))
-    return Result(ticker=ticker, price=price, last_close=last_close, session=session,
+    layers = build_layers(market, x, tech, reasons, mtf, model, pm, fund)
+    return Result(ticker=ticker, price=price, last_close=last_close, session=session, layers=layers,
                   evaluation=evaluation,
                   premarket=pm, p_up=p, action=action,
                   action_level=lvl, model=model, tech_score=tech, tech_reasons=reasons,

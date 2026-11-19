@@ -1,6 +1,7 @@
 """Market data + news fetching (free sources: Yahoo Finance via yfinance, Google News RSS)."""
 from __future__ import annotations
 
+import os
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -38,7 +39,10 @@ _cache: dict = {}
 
 
 def ttl_cache(seconds: int):
-    """Tiny in-process cache so the UI/scanner doesn't hammer Yahoo."""
+    """Tiny in-process cache so the UI/scanner doesn't hammer Yahoo.
+    STOCKAI_MIN_CACHE (seconds) raises the TTL for long batch jobs (CI reports)."""
+    seconds = max(seconds, int(os.getenv("STOCKAI_MIN_CACHE", "0") or 0))
+
     def deco(fn):
         @wraps(fn)
         def inner(*a, **kw):

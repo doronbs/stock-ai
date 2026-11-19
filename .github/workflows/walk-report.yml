@@ -1,0 +1,45 @@
+# Runs the blind day-by-day report on real market data and publishes the result to the
+# `reports` branch. Trigger: push a reports-request.json to the `run-report` branch,
+# or run manually from the Actions tab.
+name: Blind walk report
+on:
+  workflow_dispatch:
+    inputs:
+      ticker: {description: "Ticker", default: "NVDA"}
+      days: {description: "Trading days", default: "21"}
+  push:
+    branches: [run-report]
+permissions:
+  contents: write
+jobs:
+  walk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12", cache: pip, cache-dependency-path: requirements-server.txt}
+      - run: pip install -r requirements-server.txt
+      - name: Read request
+        id: req
+        run: |
+          T="${{ github.event.inputs.ticker }}"; D="${{ github.event.inputs.days }}"
+          if [ -f reports-request.json ]; then
+            T=$(python -c "import json;print(json.load(open('reports-request.json')).get('ticker','NVDA'))")
+            D=$(python -c "import json;print(json.load(open('reports-request.json')).get('days',21))")
+          fi
+          echo "ticker=${T:-NVDA}" >> $GITHUB_OUTPUT; echo "days=${D:-21}" >> $GITHUB_OUTPUT
+      - name: Blind walk (only data known on each day)
+        env: {STOCKAI_MIN_CACHE: "7200", PYTHONUNBUFFERED: "1"}
+        run: python -m engine.walk "${{ steps.req.outputs.ticker }}" --days "${{ steps.req.outputs.days }}" --out /tmp/reports 2>&1 | tee /tmp/reports_log.txt
+      - name: Publish to the reports branch
+        if: always()
+        run: |
+          mkdir -p /tmp/reports && cp /tmp/reports_log.txt /tmp/reports/log_${{ steps.req.outputs.ticker }}.txt || true
+          git config user.name "stockai-bot"; git config user.email "actions@users.noreply.github.com"
+          git fetch origin reports || true
+          git checkout -B reports origin/reports 2>/dev/null || git checkout --orphan reports
+          git rm -rq --cached . 2>/dev/null || true
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          mkdir -p reports && cp /tmp/reports/* reports/
+          git add reports && git commit -m "Walk report ${{ steps.req.outputs.ticker }} $(date -u +%F_%H%M)" && git push origin reports
