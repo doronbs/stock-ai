@@ -33,6 +33,8 @@ class Settings:
     noise: float = 0.15         # label noise band (see model.make_labels) – set by the auto-tuner
     use_mkt: bool = True        # SPY market features – set by the auto-tuner
     use_fundamentals: bool = True   # layers 4–6: reports, financial health, analysts/insiders
+    base_mode: str = "full"         # model fallback when no edge: full / recent / neutral
+    fund_scale: float = 1.0         # multiplier on layers 4–6 weights (A/B tested)
     as_of: pd.Timestamp | None = None   # run the report "as of" a past moment (NY time)
 
 
@@ -241,7 +243,8 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
             mkt = (D.truncate(spy, s.as_of, daily=not intraday) if past else spy)["Close"]
         except Exception:
             mkt = None
-    model = train_and_predict(x, intraday, s.horizon, s.buy_th, s.sell_th, mkt=mkt, noise=s.noise)
+    model = train_and_predict(x, intraday, s.horizon, s.buy_th, s.sell_th, mkt=mkt, noise=s.noise,
+                              base_mode=s.base_mode)
     tech, reasons = technical_votes(x)
     supports, resistances = I.support_resistance(x)
     patterns = I.candle_patterns(x)
@@ -323,7 +326,7 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
         except Exception:
             fund = None
     if fund:
-        wf = 0.08 if hdays < 1 else 0.15 if hdays <= 5 else 0.30 if hdays <= 20 else 0.45
+        wf = (0.08 if hdays < 1 else 0.15 if hdays <= 5 else 0.30 if hdays <= 20 else 0.45) * s.fund_scale
         for key, label in (("reports", "דוחות כספיים"), ("health", "מצב פיננסי ותמחור"),
                            ("publications", "אנליסטים ובעלי עניין")):
             L = fund[key]

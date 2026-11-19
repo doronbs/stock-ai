@@ -129,7 +129,8 @@ def walk_forward(X: pd.DataFrame, y: pd.Series, horizon: int, n_splits: int = 6,
 
 def train_and_predict(x: pd.DataFrame, intraday: bool, horizon: int,
                       buy_th: float = 0.6, sell_th: float = 0.4, mkt: pd.Series | None = None,
-                      noise: float = 0.15, shuffle_labels: bool = False) -> dict:
+                      noise: float = 0.15, shuffle_labels: bool = False,
+                      base_mode: str = "full") -> dict:
     feats = build_features(x, intraday, mkt)
     # drop feature columns that are entirely missing (e.g. no SPY data for this interval)
     feats = feats.loc[:, feats.notna().mean() > 0.5]
@@ -145,6 +146,14 @@ def train_and_predict(x: pd.DataFrame, intraday: bool, horizon: int,
 
     X, Y = labelled[feats.columns], labelled["y"]
     base_rate = float(Y.mean())
+    # What the model falls back to when it has no proven edge:
+    #  full    – share of up-moves over the whole history (carries old bull/bear drift)
+    #  recent  – half recent regime (last 60 labelled bars), half a neutral 50%
+    #  neutral – 50%
+    if base_mode == "neutral":
+        base_rate = 0.5
+    elif base_mode == "recent":
+        base_rate = 0.5 * float(Y.tail(60).mean()) + 0.25
 
     oos = walk_forward(X, Y, horizon)
     mask = oos.notna()
