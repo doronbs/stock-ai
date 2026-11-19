@@ -384,6 +384,22 @@ def render_analysis():
 
     st.plotly_chart(price_chart(r), use_container_width=True)
 
+    if getattr(r, "layers", None):
+        st.markdown("#### 🧭 כרטיס 6 השכבות")
+        st.caption("כל שכבה מקבלת ציון מ-1- (שלילי מאוד) עד 1+ (חיובי מאוד). "
+                   "דוחות ונתונים נלקחים רק ממה שכבר פורסם עד רגע הניתוח.")
+        cols = st.columns(3)
+        for i, L in enumerate(r.layers):
+            sc = L["score"]
+            color = "#16a34a" if sc > 0.15 else "#dc2626" if sc < -0.15 else "#6b7280"
+            with cols[i % 3]:
+                st.markdown(f"<div style='border:1px solid {color}55;border-radius:12px;padding:10px;margin-bottom:8px'>"
+                            f"<b>{L['name']}</b><br><span style='font-size:1.5rem;font-weight:800;color:{color}'>"
+                            f"{sc:+.2f}</span></div>", unsafe_allow_html=True)
+                with st.expander("פירוט"):
+                    for n_ in L["notes"] or ["אין נתונים"]:
+                        st.markdown(f"<div class='reason'>{n_}</div>", unsafe_allow_html=True)
+
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown("#### 🧠 למה? – סיבות טכניות")
@@ -951,7 +967,77 @@ gated(tab_n, "show_news", "▶️ טען חדשות", render_news)
 
 
 # ───── Backtest ─────
+def start_walk_job(store, ticker, n_days, s, owner):
+    from engine.walk import walk
+    job = {"status": "running", "progress": 0.0, "current": "", "ticker": ticker, "owner": owner,
+           "started": time.time()}
+    store.setdefault("walks", {})[owner] = job
+
+    def run():
+        try:
+            def prog(p, t):
+                job["progress"], job["current"] = p, t
+            job["report"] = walk(ticker, n_days, dataclasses.replace(s, interval="1d", horizon=1), prog)
+            job["status"] = "done"
+        except Exception as e:  # pragma: no cover
+            job["status"], job["error"] = "error", str(e)
+        job["finished"] = time.time()
+    threading.Thread(target=run, daemon=True).start()
+
+
+def render_walk(job):
+    if job["status"] == "running":
+        st.progress(job["progress"], f"🔄 בודק את {job['ticker']} יום אחר יום – {job['current']} "
+                                     f"({job['progress'] * 100:.0f}%)")
+        return
+    if job["status"] == "error":
+        st.error(f"הבדיקה נכשלה: {job.get('error')}")
+        return
+    rep_ = job["report"]
+    sm = rep_["summary"]
+    pc = lambda v: "—" if v != v else f"{v * 100:.0f}%"
+    st.markdown(f"**{rep_['ticker']} · {rep_['days']} ימי מסחר · תחזית ליום הבא**")
+    k1, k2, k3 = st.columns(3)
+    k1.metric("המלצות שצדקו", f"{sm['signal_hits']}/{sm['signals']}", pc(sm["signal_rate"]), delta_color="off")
+    k2.metric("כיוון נכון כשנטתה", f"{sm['direction_hits']}/{sm['leaning_days']}", pc(sm["direction_rate"]),
+              delta_color="off")
+    k3.metric("אסטרטגיה מול קנה-והחזק", f"{sm['strategy_pct']:+.1f}%", f"{sm['buy_hold_pct']:+.1f}%",
+              delta_color="off")
+    st.caption(f"ציון Brier {sm['brier']:.3f} (0.250 = ניחוש 50%, נמוך יותר = טוב יותר) · "
+               f"המניה עלתה ב-{sm['up_days']} מתוך {sm['days']} הימים")
+    rows_ = [x for x in rep_["rows"] if "error" not in x]
+    df = pd.DataFrame([{"תאריך": x["date"][5:], "סגירה": x["close"], "סיכוי עלייה %": x["p_up"] * 100,
+                        "המלצה": x["action"], "שוק": x.get("L1"), "גרף": x.get("L2"), "היסטוריה": x.get("L3"),
+                        "דוחות": x.get("L4"), "פיננסי": x.get("L5"), "פרסומים": x.get("L6"),
+                        "סגירה למחרת": x["next_close"], "שינוי %": x["ret_pct"], "צדקה?": x["verdict"]}
+                       for x in rows_][::-1])
+    st.dataframe(df.style.format({c: "{:.2f}" for c in df.columns if pd.api.types.is_float_dtype(df[c])},
+                                 na_rep="—"), hide_index=True, use_container_width=True, height=520)
+
+
 with tab_b:
+    st.markdown("### 📆 בדיקה עיוורת יום-אחר-יום")
+    st.caption("לכל יום מסחר בתקופה: המערכת מריצה את כל 6 השכבות כאילו היום הוא אותו יום (רק מידע שפורסם עד "
+               "הסגירה), חוזה את היום הבא, ואז משווה למה שקרה באמת.")
+    wc1, wc2 = st.columns(2)
+    w_t = wc1.text_input("מניה", value="NVDA", key="walk_ticker").upper().strip()
+    w_d = wc2.number_input("ימי מסחר אחורה", 5, 60, 21, key="walk_days")
+    store_w = scan_store()
+    wj = store_w.setdefault("walks", {}).get(OWNER)
+    if st.button("▶️ הרץ בדיקה יום-אחר-יום", key="run_walk", type="primary",
+                 disabled=bool(wj and wj["status"] == "running") or not w_t):
+        start_walk_job(store_w, w_t, int(w_d), settings, OWNER)
+        wj = store_w["walks"][OWNER]
+    if wj:
+        if wj["status"] == "running":
+            def live_w():
+                render_walk(wj)
+                if wj["status"] != "running":
+                    st.rerun()
+            st.fragment(run_every=3)(live_w)()
+        else:
+            render_walk(wj)
+    st.divider()
     r = ss.get("result")
     if not r:
         st.info("הרץ קודם ניתוח מניה בלשונית הראשונה")
