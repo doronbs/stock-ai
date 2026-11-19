@@ -33,7 +33,9 @@ class Settings:
     noise: float = 0.15         # label noise band (see model.make_labels) – set by the auto-tuner
     use_mkt: bool = True        # SPY market features – set by the auto-tuner
     use_fundamentals: bool = True   # layers 4–6: reports, financial health, analysts/insiders
-    base_mode: str = "full"         # model fallback when no edge: full / recent / neutral
+    base_mode: str = "neutral"      # model fallback when no edge: full / recent / neutral
+                                    # (A/B 19/11/2026, 10 stocks × 60 days: neutral had the best
+                                    #  Brier score in BOTH the selection and the confirmation period)
     fund_scale: float = 1.0         # multiplier on layers 4–6 weights (A/B tested)
     as_of: pd.Timestamp | None = None   # run the report "as of" a past moment (NY time)
 
@@ -326,7 +328,9 @@ def analyze(ticker: str, s: Settings, market: dict | None = None,
         except Exception:
             fund = None
     if fund:
-        wf = (0.08 if hdays < 1 else 0.15 if hdays <= 5 else 0.30 if hdays <= 20 else 0.45) * s.fund_scale
+        # A/B test: on a 1-day horizon the fundamentals layers only added noise → weight 0 there.
+        # Longer horizons keep a growing weight (not yet A/B-tested).
+        wf = (0.0 if hdays <= 1 else 0.10 if hdays <= 5 else 0.25 if hdays <= 20 else 0.45) * s.fund_scale
         for key, label in (("reports", "דוחות כספיים"), ("health", "מצב פיננסי ותמחור"),
                            ("publications", "אנליסטים ובעלי עניין")):
             L = fund[key]

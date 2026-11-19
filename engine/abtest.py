@@ -15,6 +15,8 @@ from pathlib import Path
 from .analyzer import Settings
 from .walk import walk
 
+# Result 19/11/2026 (10 stocks, 60 days, 3,000 blind predictions): V3 best Brier in both periods
+# (0.2513 / 0.2565 vs current 0.2552 / 0.2656) → adopted as the default. None beat a 50% coin (0.25).
 VARIANTS = {
     "V0": dict(base_mode="full", fund_scale=1.0),      # current
     "V1": dict(base_mode="full", fund_scale=0.0),      # no fundamentals on a 1-day horizon
